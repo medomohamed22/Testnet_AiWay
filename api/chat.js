@@ -1,13 +1,36 @@
+import { generateDocumentBuffer, documentFilename, documentContentType } from '../lib/document-files.js';
 import { affordableOutputLimit, allowMethods, appError, chargeTokens, classifyTokenChargeFailure, cleanText, db, errorDetails, estimateChatCharge, fetchWithTimeout, getAvailableModels, getModel, getTrialModelId, handleError, isLowBalance, localize, openRouterError, requestLocale, requireUser, shouldTryModelFallback, ensureConversationOwner, normalizeRequestId, reserveAiTokens, finalizeAiTokens, releaseAiTokens, chooseAutoModel, isFreeModel, claimFreeDailyUse, createDownloadTicket, verifyDownloadTicket } from './_lib.js';
 
 function extractDownloadableFiles(text) {
   const files = [];
-  const re = /```file-([^\n`]+)\n([\s\S]*?)```/g;
+  const source = String(text || '');
+  const textRe = /```file-([^\n`]+)\n([\s\S]*?)```/g;
   let match;
-  while ((match = re.exec(String(text || ''))) && files.length < 8) {
-    files.push({ name: match[1].trim(), content: match[2].replace(/\n$/, '') });
+  while ((match = textRe.exec(source)) && files.length < 8) {
+    files.push({ kind: 'text', name: match[1].trim(), content: match[2].replace(/\n$/, '') });
+  }
+  const documentRe = /```(docx|xlsx|pptx|pdf)-json\n([\s\S]*?)```/gi;
+  while ((match = documentRe.exec(source)) && files.length < 8) {
+    try {
+      const kind = match[1].toLowerCase();
+      const spec = JSON.parse(match[2]);
+      files.push({ kind, name: documentFilename(kind, spec), spec });
+    } catch {}
   }
   return files;
+}
+
+async function materializeFile(file) {
+  if (file.kind === 'text') return {
+    name: safeDownloadFilename(file.name),
+    body: Buffer.from(file.content, 'utf8'),
+    contentType: fileContentType(file.name)
+  };
+  return {
+    name: safeDownloadFilename(file.name),
+    body: await generateDocumentBuffer(file.kind, file.spec),
+    contentType: documentContentType(file.kind)
+  };
 }
 
 function safeDownloadFilename(value) {
@@ -40,17 +63,19 @@ function crc32(buffer) {
   }
   return (crc ^ 0xffffffff) >>> 0;
 }
-function makeStoreZip(files) {
+async function makeStoreZip(files) {
   const local = [], central = []; let offset = 0;
-  for (const file of files) {
+  for (const sourceFile of files) {
+    const file = await materializeFile(sourceFile);
     const name = Buffer.from(safeDownloadFilename(file.name), 'utf8');
-    const data = Buffer.from(file.content, 'utf8'); const crc = crc32(data);
+    const data = file.body; const crc = crc32(data);
     const header = Buffer.alloc(30); header.writeUInt32LE(0x04034b50,0); header.writeUInt16LE(20,4); header.writeUInt16LE(0x800,6); header.writeUInt16LE(0,8); header.writeUInt16LE(0,10); header.writeUInt16LE(0,12); header.writeUInt32LE(crc,14); header.writeUInt32LE(data.length,18); header.writeUInt32LE(data.length,22); header.writeUInt16LE(name.length,26);
     local.push(header,name,data);
     const ch = Buffer.alloc(46); ch.writeUInt32LE(0x02014b50,0); ch.writeUInt16LE(20,4); ch.writeUInt16LE(20,6); ch.writeUInt16LE(0x800,8); ch.writeUInt16LE(0,10); ch.writeUInt16LE(0,12); ch.writeUInt16LE(0,14); ch.writeUInt32LE(crc,16); ch.writeUInt32LE(data.length,20); ch.writeUInt32LE(data.length,24); ch.writeUInt16LE(name.length,28); ch.writeUInt32LE(offset,42); central.push(ch,name); offset += header.length + name.length + data.length;
   }
   const centralSize = central.reduce((n,b)=>n+b.length,0); const end=Buffer.alloc(22); end.writeUInt32LE(0x06054b50,0); end.writeUInt16LE(files.length,8); end.writeUInt16LE(files.length,10); end.writeUInt32LE(centralSize,12); end.writeUInt32LE(offset,16); return Buffer.concat([...local,...central,end]);
 }
+
 async function getOwnedAssistantMessage(messageId, userId) {
   const { data: message, error } = await db().from('messages')
     .select('id,content,role').eq('id', messageId).eq('user_id', userId).eq('role', 'assistant').single();
@@ -80,11 +105,11 @@ async function nativeDownload(req, res) {
   let body, filename, contentType;
   if (ticket.kind === 'project') {
     if (!files.length) throw new Error('FILE_NOT_FOUND');
-    body = makeStoreZip(files); filename = 'aiway-project.zip'; contentType = 'application/zip';
+    body = await makeStoreZip(files); filename = 'aiway-project.zip'; contentType = 'application/zip';
   } else {
     const fileIndex = Number(ticket.fileIndex);
     const file = files[fileIndex]; if (!file) throw new Error('FILE_NOT_FOUND');
-    filename = safeDownloadFilename(file.name); body = Buffer.from(file.content, 'utf8'); contentType = fileContentType(filename);
+    const materialized = await materializeFile(file); filename = materialized.name; body = materialized.body; contentType = materialized.contentType;
   }
   const asciiName = filename.replace(/[^a-zA-Z0-9._-]/g, '-') || 'aiway-download';
   res.status(200);
@@ -100,7 +125,7 @@ async function downloadGeneratedProject(req,res) {
   const messageId=String(req.query?.messageId||req.body?.messageId||''); if(!messageId) throw new Error('UNAUTHORIZED');
   const user=await requireUser(req);
   const {data:message,error}=await db().from('messages').select('id,content,role').eq('id',messageId).eq('user_id',user.id).eq('role','assistant').single(); if(error||!message) throw new Error('FILE_NOT_FOUND');
-  const files=extractDownloadableFiles(message.content); if(!files.length) throw new Error('FILE_NOT_FOUND'); const body=makeStoreZip(files);
+  const files=extractDownloadableFiles(message.content); if(!files.length) throw new Error('FILE_NOT_FOUND'); const body=await makeStoreZip(files);
   res.status(200); res.setHeader('Content-Type','application/zip'); res.setHeader('Content-Length',String(body.length)); res.setHeader('Content-Disposition',`attachment; filename="aiway-project.zip"`); res.setHeader('Cache-Control','private, no-store, max-age=0'); return res.end(body);
 }
 async function downloadGeneratedFile(req, res) {
@@ -117,12 +142,13 @@ async function downloadGeneratedFile(req, res) {
 
   const file = extractDownloadableFiles(message.content)[fileIndex];
   if (!file) throw new Error('FILE_NOT_FOUND');
-  const filename = safeDownloadFilename(file.name);
-  const body = Buffer.from(file.content, 'utf8');
+  const materialized = await materializeFile(file);
+  const filename = materialized.name;
+  const body = materialized.body;
   const asciiName = filename.replace(/[^a-zA-Z0-9._-]/g, '-') || 'aiway-file.txt';
 
   res.status(200);
-  res.setHeader('Content-Type', fileContentType(filename));
+  res.setHeader('Content-Type', materialized.contentType);
   res.setHeader('Content-Length', String(body.length));
   res.setHeader('Content-Disposition', `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(filename)}`);
   res.setHeader('Cache-Control', 'private, no-store, max-age=0');
@@ -137,7 +163,12 @@ Maintain full continuity with all earlier messages in this conversation. Never i
 Return polished Markdown only. Keep links valid and code syntactically complete. Do not expose partial markup or unfinished code.
 For a downloadable code/text file, use a fenced block whose language is file-FILENAME, for example: \`\`\`file-index.html. Put only the complete file contents inside it.
 When the user asks for a long code file, prefer a downloadable file block rather than an excessively long inline explanation.
-For a PowerPoint, return one fenced pptx-json block containing valid JSON shaped as {"filename":"presentation.pptx","slides":[{"title":"...","bullets":["..."]}]}. Keep slide text concise and valid JSON with no comments.
+When a document output format is requested, return exactly one fenced JSON block and no surrounding prose:
+- Word: \`\`\`docx-json with {"filename":"document.docx","title":"...","sections":[{"heading":"...","paragraphs":["..."],"bullets":["..."]}]}
+- Excel: \`\`\`xlsx-json with {"filename":"workbook.xlsx","sheets":[{"name":"Sheet1","rtl":false,"columns":["Column 1"],"rows":[["Value"]]}]}
+- PowerPoint: \`\`\`pptx-json with {"filename":"presentation.pptx","title":"...","slides":[{"title":"...","bullets":["..."]}]}
+- PDF: \`\`\`pdf-json with {"filename":"document.pdf","title":"...","sections":[{"heading":"...","paragraphs":["..."],"bullets":["..."]}]}
+The JSON must be valid, concise, complete, and contain no comments or Markdown inside string values.
 Use short headings only when useful, fenced code blocks with a language, and tables only for real comparisons.`;
 
 async function readProviderFailure(response) {
@@ -159,7 +190,7 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') throw appError('INVALID_REQUEST');
 
     const user = await requireUser(req);
-    const { conversationId, modelId, messages, temperature = 0.7, webSearch = false, attachments = [], requestId: rawRequestId, continueFromMessageId: rawContinueFromMessageId } = req.body || {};
+    const { conversationId, modelId, messages, temperature = 0.7, webSearch = false, attachments = [], outputFormat = '', requestId: rawRequestId, continueFromMessageId: rawContinueFromMessageId } = req.body || {};
     const continueFromMessageId = cleanText(rawContinueFromMessageId, 80);
     const requestId = normalizeRequestId(rawRequestId);
     reservationUserId = user.id; reservationRequestId = requestId;
@@ -243,7 +274,14 @@ export default async function handler(req, res) {
     if (!model) throw appError('MODEL_UNAVAILABLE');
     if (isFreeModel(model)) await claimFreeDailyUse(supabase, user.id, 'chat');
     const language = detectLanguage(latestTextValue);
-    const safeMessages = [{ role: 'system', content: formatSystemPrompt(model, language) }, ...cleaned.filter(message => message.role !== 'system')];
+    const requestedFormat = ['docx','xlsx','pptx','pdf'].includes(String(outputFormat).toLowerCase()) ? String(outputFormat).toLowerCase() : '';
+    const formatInstruction = requestedFormat ? {
+      docx: 'Create the answer as a Microsoft Word document using the docx-json schema from the system instructions.',
+      xlsx: 'Create the answer as a Microsoft Excel workbook using the xlsx-json schema from the system instructions.',
+      pptx: 'Create the answer as a Microsoft PowerPoint presentation using the pptx-json schema from the system instructions.',
+      pdf: 'Create the answer as a PDF document using the pdf-json schema from the system instructions.'
+    }[requestedFormat] : '';
+    const safeMessages = [{ role: 'system', content: `${formatSystemPrompt(model, language)}${formatInstruction ? `\n\nMANDATORY OUTPUT FORMAT: ${formatInstruction} Return only the fenced JSON block.` : ''}` }, ...cleaned.filter(message => message.role !== 'system')];
 
     const initialEstimate = estimateChatCharge(model.pricing, safeMessages, webSearch, 512);
     if (availableTokens < initialEstimate.chargedTokens) {
