@@ -321,7 +321,7 @@ export default async function handler(req, res) {
       if (error) throw appError('DATABASE_ERROR', {}, error);
     }
 
-    if (agentMode === true && !continuationTarget && !webSearch && safeAttachments.length === 0) {
+    if (agentMode === true && !continuationTarget) {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -347,7 +347,7 @@ export default async function handler(req, res) {
           body: JSON.stringify({
             model: model.id,
             messages: [
-              { role: 'system', content: `${formatSystemPrompt(model, language)}\n\nYou are the ${role} in a controlled multi-agent software workflow. Complete only your assigned stage and return a finished response for that stage.` },
+              { role: 'system', content: `${formatSystemPrompt(model, language)}\n\nYou are the ${role} in a controlled multi-agent workflow. The user's request may be about programming, study, training, planning, writing, research, analysis, or any other legitimate task. Complete only your assigned stage and return a polished, finished response for that stage.` },
               { role: 'user', content: `${instruction}\n\nCONTEXT:\n${cleanText(context, 60000)}` }
             ],
             temperature: agentTemperature,
@@ -370,18 +370,18 @@ export default async function handler(req, res) {
       let generationId = null;
       const pendingPlan = extractAgentPlan(cleaned);
       const assistantMessages = cleaned.filter(m => m.role === 'assistant' && typeof m.content === 'string');
-      const latestCodeOutput = [...assistantMessages].reverse().find(m => /AIWAY_AGENT_CODE/.test(m.content))?.content
-        ?.replace(/<!--\s*AIWAY_AGENT_CODE\s*-->/g, '').trim() || '';
+      const latestExecutionOutput = [...assistantMessages].reverse().find(m => /AIWAY_AGENT_EXECUTION/.test(m.content))?.content
+        ?.replace(/<!--\s*AIWAY_AGENT_EXECUTION\s*-->/g, '').trim() || '';
       const originalRequests = cleaned.filter(m => m.role === 'user').map(m => typeof m.content === 'string' ? m.content : '').join('\n\n');
 
       if (!['plan', 'code', 'review'].includes(agentStep)) agentStep = 'plan';
       if (agentStep === 'plan') {
         emitStage('planning', 'عدة وكلاء يحللون الطلب ويجهزون الخطة', 'Multiple agents are analyzing the request and preparing the plan');
         const planner = await callAgent({
-          role: 'software planning agent', maxTokens: 1800,
+          role: 'planning and strategy agent', maxTokens: 2200,
           instruction: language === 'ar'
-            ? 'حلّل طلب المستخدم كمهندس برمجيات. أنشئ خطة تنفيذ عملية ومكتملة فقط تشمل الهدف، المكونات أو الملفات، خطوات التنفيذ، المخاطر، ومعايير القبول. لا تكتب كودًا الآن، ولا تدّع التنفيذ.'
-            : 'Analyze the request as a software engineer. Produce a complete practical implementation plan covering the goal, components or files, implementation steps, risks, and acceptance criteria. Do not write code or claim implementation.',
+            ? 'حلّل طلب المستخدم مهما كان نوعه. أنشئ خطة عملية ومكتملة تشمل الهدف، المدخلات المطلوبة، خطوات التنفيذ، المخرجات المتوقعة، المخاطر أو النواقص، ومعايير النجاح. لا تنفذ المهمة الآن ولا تدّع التنفيذ.'
+            : 'Analyze the user request regardless of its type. Produce a complete practical plan covering the goal, required inputs, execution steps, expected outputs, risks or gaps, and success criteria. Do not execute the task or claim completion yet.',
           context: latestTextValue
         });
         workflowUsage = mergeUsage(workflowUsage, planner.usage); generationId = planner.generationId;
@@ -390,27 +390,27 @@ export default async function handler(req, res) {
           : `## Planning agent result\n\n${planner.content}\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`;
       } else if (agentStep === 'code') {
         if (!pendingPlan) throw appError('INVALID_CHAT_REQUEST');
-        emitStage('coding', 'وكيل البرمجة ينفذ الخطة ويكتب الملفات', 'Coding agent is implementing the plan and writing the files');
+        emitStage('executing', 'وكيل التنفيذ يطبق الخطة ويجهز النتيجة', 'The execution agent is applying the plan and preparing the result');
         const coder = await callAgent({
-          role: 'senior coding agent', maxTokens: Math.min(7500, Math.max(2200, initialMaxTokens)), temperature: 0.15,
+          role: 'senior execution agent', maxTokens: Math.min(7500, Math.max(2200, initialMaxTokens)), temperature: 0.18,
           instruction: language === 'ar'
-            ? 'نفّذ الخطة المعتمدة كاملة. اكتب كودًا صالحًا للتشغيل وليس pseudo-code. ضع كل ملف كامل داخل كتلة file-FILENAME. لا تختصر الملفات ولا تدّع تشغيل اختبارات لم تُشغّل.'
-            : 'Implement the approved plan completely. Write runnable code, not pseudocode. Put every complete file in a file-FILENAME fenced block. Do not omit file contents or claim tests were run when they were not.',
+            ? 'نفّذ الخطة المعتمدة كاملة وفق نوع طلب المستخدم. إذا كان الطلب برمجيًا فاكتب كودًا صالحًا للتشغيل وضع كل ملف كامل داخل كتلة file-FILENAME. وإذا كان دراسة أو تدريبًا أو كتابة أو تحليلًا فأنتج المحتوى النهائي الكامل القابل للاستخدام. لا تختصر النتيجة ولا تدّع تنفيذ اختبارات أو إجراءات لم تحدث.'
+            : 'Execute the approved plan completely according to the request type. For programming tasks, write runnable code and put every complete file in a file-FILENAME fenced block. For study, training, writing, analysis, or other tasks, produce the complete final usable deliverable. Do not omit essential content or claim tests or actions that were not actually performed.',
           context: `APPROVED PLAN:\n${pendingPlan}\n\nORIGINAL REQUESTS:\n${originalRequests}`
         });
         workflowUsage = mergeUsage(workflowUsage, coder.usage); generationId = coder.generationId;
         answer = language === 'ar'
-          ? `## نتيجة وكيل البرمجة\n\n${coder.content}\n\n<!-- AIWAY_AGENT_CODE -->`
-          : `## Coding agent result\n\n${coder.content}\n\n<!-- AIWAY_AGENT_CODE -->`;
+          ? `## نتيجة وكيل التنفيذ\n\n${coder.content}\n\n<!-- AIWAY_AGENT_EXECUTION -->`
+          : `## Execution agent result\n\n${coder.content}\n\n<!-- AIWAY_AGENT_EXECUTION -->`;
       } else {
-        if (!pendingPlan || !latestCodeOutput) throw appError('INVALID_CHAT_REQUEST');
-        emitStage('reviewing', 'فريق المراجعة يفحص الكود ويصحح الأخطاء', 'Review agents are inspecting and correcting the code');
+        if (!pendingPlan || !latestExecutionOutput) throw appError('INVALID_CHAT_REQUEST');
+        emitStage('reviewing', 'وكيل المراجعة يفحص النتيجة ويصحح أي مشكلة', 'The review agent is checking the result and correcting any issue');
         const reviewer = await callAgent({
-          role: 'senior code review and security agent', maxTokens: Math.min(8000, Math.max(2400, initialMaxTokens)), temperature: 0.1,
+          role: 'senior quality review and correction agent', maxTokens: Math.min(8000, Math.max(2400, initialMaxTokens)), temperature: 0.1,
           instruction: language === 'ar'
-            ? 'راجع الكود مقابل الخطة والطلب. اكتشف وأصلح أخطاء المنطق والصياغة والأمان والنواقص مباشرة. أعد النسخة النهائية الكاملة الجاهزة للاستخدام، مع ملخص قصير للمراجعة ثم كل الملفات المصححة كاملة.'
-            : 'Review the code against the plan and request. Find and directly fix logic, syntax, security, and completeness issues. Return the full final usable version, with a short review summary followed by every corrected file in full.',
-          context: `PLAN:\n${pendingPlan}\n\nCODE TO REVIEW:\n${latestCodeOutput}`
+            ? 'راجع نتيجة التنفيذ مقابل الخطة وطلب المستخدم. اكتشف أي خطأ أو نقص أو تناقض أو مشكلة جودة وصححه مباشرة. أعد النسخة النهائية الكاملة الجاهزة للاستخدام، مع ملخص قصير لما تم إصلاحه. إذا كانت النتيجة كودًا فأعد كل الملفات المصححة كاملة.'
+            : 'Review the execution result against the plan and user request. Find and directly fix any error, omission, inconsistency, or quality issue. Return the complete final usable version with a short summary of corrections. If the result is code, return every corrected file in full.',
+          context: `PLAN:\n${pendingPlan}\n\nRESULT TO REVIEW:\n${latestExecutionOutput}`
         });
         workflowUsage = mergeUsage(workflowUsage, reviewer.usage); generationId = reviewer.generationId;
         answer = language === 'ar' ? `## نتيجة وكيل المراجعة\n\n${reviewer.content}` : `## Review agent result\n\n${reviewer.content}`;
