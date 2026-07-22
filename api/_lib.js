@@ -211,18 +211,15 @@ export async function requireUser(req) {
   requireEnv();
   const authorization = req.headers.authorization || '';
   const headerToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
-  const cookieToken = cookieValue(req, SESSION_COOKIE);
-  // Native browser downloads cannot attach an Authorization header. For the two
-  // attachment-only POST routes, the signed app token is sent in the HTTPS form body.
+  // Authentication is intentionally cookie-free. Pi Browser WebViews can block,
+  // replay, or isolate cookies, so protected API routes accept only an explicit
+  // app token from the Authorization header. The body token remains limited to
+  // signed native-download POST requests that cannot attach custom headers.
   const bodyToken = req.method === 'POST' && String(req.body?.action || '').startsWith('download-')
     ? String(req.body?.authToken || '')
     : '';
-  // Prefer an explicit Bearer token over the browser cookie. Pi Browser can
-  // retain a stale/blocked cookie even after a successful SDK sign-in; choosing
-  // the cookie first would reject the fresh token returned by /api/pi-login.
-  const token = headerToken || bodyToken || cookieToken;
+  const token = headerToken || bodyToken;
   if (!token) throw appError('UNAUTHORIZED');
-  if (!headerToken && !bodyToken && cookieToken) enforceSameOrigin(req);
   let payload;
   try {
     ({ payload } = await jwtVerify(token, new TextEncoder().encode(appJwtSecret), {
