@@ -1,5 +1,5 @@
 import { generateDocumentBuffer, documentFilename, documentContentType } from '../lib/document-files.js';
-import { affordableOutputLimit, allowMethods, appError, chargeTokens, classifyTokenChargeFailure, cleanText, db, errorDetails, estimateChatCharge, fetchWithTimeout, getAvailableModels, getModel, getTrialModelId, handleError, isLowBalance, localize, openRouterError, requestLocale, requireUser, shouldTryModelFallback, ensureConversationOwner, normalizeRequestId, reserveAiTokens, finalizeAiTokens, releaseAiTokens, chooseAutoModel, isFreeModel, claimFreeDailyUse, createDownloadTicket, verifyDownloadTicket } from './_lib.js';
+import { affordableOutputLimit, allowMethods, appError, chargeTokens, classifyTokenChargeFailure, cleanText, db, errorDetails, estimateChatCharge, fetchWithTimeout, getAvailableModels, getModel, getTrialModelId, handleError, isLowBalance, localize, openRouterError, requestLocale, requireUser, shouldTryModelFallback, ensureConversationOwner, normalizeRequestId, reserveAiTokens, finalizeAiTokens, releaseAiTokens, chooseAutoModel, isFreeModel, claimFreeDailyUse, createDownloadTicket, verifyDownloadTicket, enforceRateLimit, requestIp } from './_lib.js';
 
 function extractDownloadableFiles(text) {
   const files = [];
@@ -190,6 +190,9 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') throw appError('INVALID_REQUEST');
 
     const user = await requireUser(req);
+    const chatDb = db();
+    await enforceRateLimit(chatDb, `chat:user:${user.id}`, 24, 60);
+    await enforceRateLimit(chatDb, `chat:ip:${requestIp(req)}`, 60, 60);
     const { conversationId, modelId, messages, temperature = 0.7, webSearch = false, attachments = [], outputFormat = '', requestId: rawRequestId, continueFromMessageId: rawContinueFromMessageId } = req.body || {};
     const continueFromMessageId = cleanText(rawContinueFromMessageId, 80);
     const requestId = normalizeRequestId(rawRequestId);
@@ -200,7 +203,7 @@ export default async function handler(req, res) {
     let model = modelId === 'aiway/auto' ? null : await getModel(modelId);
     if (modelId !== 'aiway/auto' && !model) throw appError('MODEL_UNAVAILABLE');
 
-    const supabase = db();
+    const supabase = chatDb;
     reservationSupabase = supabase;
     await ensureConversationOwner(supabase, conversationId, user.id);
     let continuationTarget = null;

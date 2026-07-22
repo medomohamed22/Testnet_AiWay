@@ -1,4 +1,4 @@
-import { allowMethods, cleanText, db, handleError, json, localize, requestLocale, requireUser } from './_lib.js';
+import { allowMethods, cleanText, db, handleError, json, localize, requestLocale, requireUser, enforceRateLimit, requestIp } from './_lib.js';
 
 const REPORT_REASONS=['not_working','scam','wrong_link','impersonation','inappropriate','other'];
 
@@ -24,6 +24,8 @@ export default async function handler(req,res){
     if(!app||app.status!=='published')return json(res,404,{error:localize(locale,'التطبيق غير موجود أو غير منشور.','The app was not found or is not published.'),code:'FILE_NOT_FOUND'});
 
     if(action==='view'||action==='get_click'){
+      await enforceRateLimit(supabase,`app-event:ip:${requestIp(req)}`,60,60);
+      await enforceRateLimit(supabase,`app-event:${appId}:${requestIp(req)}`,20,60);
       const visitorId=cleanText(body.visitorId,100);
       if(!/^[a-zA-Z0-9_-]{16,100}$/.test(visitorId))return json(res,400,{error:localize(locale,'معرّف الزائر غير صالح.','The visitor id is invalid.'),code:'INVALID_REQUEST'});
       const {error}=await supabase.from('app_events').insert({app_id:appId,visitor_id:visitorId,event_type:action});

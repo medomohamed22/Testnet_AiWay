@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { allowMethods, appError, db, handleError, json, localize, piApiError, requestLocale, signAppToken, requestIp, enforceRateLimit } from './_lib.js';
+import { allowMethods, appError, db, handleError, json, localize, piApiError, requestLocale, signAppToken, requestIp, enforceRateLimit, setSessionCookie, clearSessionCookie } from './_lib.js';
 
 const BRIDGE_TTL_MS = 10 * 60 * 1000;
 
@@ -18,7 +18,7 @@ function safeEqualHex(a, b) {
 }
 
 function bridgeStateSignature(requestId) {
-  const secret = String(process.env.APP_JWT_SECRET || '');
+  const secret = String(process.env.PI_BRIDGE_HMAC_SECRET || process.env.APP_JWT_SECRET || '');
   if (!secret) throw appError('SERVER_CONFIG_ERROR');
   return createHmac('sha256', secret)
     .update(`${requestId}:pi-signin-state`)
@@ -43,7 +43,7 @@ function parseBridgeState(value) {
 }
 
 function exchangeCode(requestId, pollToken) {
-  const secret = String(process.env.APP_JWT_SECRET || '');
+  const secret = String(process.env.PI_BRIDGE_HMAC_SECRET || process.env.APP_JWT_SECRET || '');
   return createHmac('sha256', secret).update(`${requestId}:${pollToken}:pi-login-bridge`).digest('base64url');
 }
 
@@ -102,6 +102,8 @@ export default async function handler(req, res) {
     const supabase = db();
     const ip = requestIp(req);
     const action = String(req.body?.action || 'login').trim();
+
+    if (action === 'logout') { clearSessionCookie(res); return json(res, 200, { loggedOut: true }); }
 
     if (action === 'bridge-start') {
       await enforceRateLimit(supabase, `pi-bridge-start:${ip}`, 8, 60);
@@ -190,7 +192,8 @@ export default async function handler(req, res) {
         .single();
       if (userError || !user) throw appError('DATABASE_ERROR', {}, userError);
       const token = await signAppToken(user);
-      return json(res, 200, { token, user });
+      setSessionCookie(res, token);
+      return json(res, 200, { user, session: true });
     }
 
     await enforceRateLimit(supabase, `login:${ip}`, 10, 60);
@@ -202,7 +205,8 @@ export default async function handler(req, res) {
     const { piUid, username } = await verifyPiAccessToken(accessToken);
     const user = await upsertPiUser(supabase, piUid, username);
     const token = await signAppToken(user);
-    return json(res, 200, { token, user });
+    setSessionCookie(res, token);
+    return json(res, 200, { user, session: true });
   } catch (error) {
     if (error?.name === 'AbortError') return handleError(appError('REQUEST_TIMEOUT', {}, error), res, localize(locale, 'انتهت مهلة تسجيل الدخول. حاول مرة أخرى.', 'Sign-in timed out. Try again.'), locale);
     if (error?.code === 'PI_LOGIN_BRIDGE_EXPIRED') return json(res, 410, {

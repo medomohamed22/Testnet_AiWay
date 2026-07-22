@@ -1,4 +1,4 @@
-import {allowMethods,appError,cleanText,createDownloadTicket,db,handleError,json,localize,requestLocale,requireUser,requireAdmin,sendTelegramNotification,telegramHtml,formatCairoDateTime} from './_lib.js';
+import {allowMethods,appError,cleanText,createDownloadTicket,db,handleError,json,localize,requestLocale,requireUser,requireAdmin,sendTelegramNotification,telegramHtml,formatCairoDateTime,enforceRateLimit,requestIp} from './_lib.js';
 
 async function handleSupport(req,res,user,s,locale){
   const mode=String(req.query?.mode||req.body?.mode||'');
@@ -66,6 +66,8 @@ export default async function handler(req,res){
   const locale=requestLocale(req);
   try{
     const user=await requireUser(req),s=db();
+    await enforceRateLimit(s,`conversations:user:${user.id}`,req.method==='GET'?120:30,60);
+    await enforceRateLimit(s,`conversations:ip:${requestIp(req)}`,req.method==='GET'?240:60,60);
     const supportHandled=await handleSupport(req,res,user,s,locale);if(supportHandled!==false)return supportHandled;
 
     if(req.method==='GET'){
@@ -75,13 +77,13 @@ export default async function handler(req,res){
         const includeImages=String(req.query?.includeImages||'1')!=='0';
 
         if(imagesOnly){
-          const {data:images,error}=await s.from('generated_images').select('*')
+          const {data:images,error}=await s.from('generated_images').select('id,message_id,conversation_id,model_id,prompt,media_type,storage_status,fallback_reason,width,height,created_at')
             .eq('conversation_id',id).eq('user_id',user.id).order('created_at',{ascending:true});
           if(error)throw appError('DATABASE_ERROR',{},error);
           const hydrated=await Promise.all((images||[]).map(async image=>{
             const output={...image};
-            if(output.storage_path||output.thumbnail_data||output.source_url){
-              const ticket=await createDownloadTicket({sub:user.id,imageId:output.id,kind:'image-view'},'2h');
+            if(output.storage_status!=='expired'){
+              const ticket=await createDownloadTicket({sub:user.id,imageId:output.id,kind:'image-view'},'10m');
               output.display_url=`/api/image?action=view&ticket=${encodeURIComponent(ticket)}`;
             }
             return output;
@@ -90,11 +92,11 @@ export default async function handler(req,res){
         }
 
         const {data:conversation,error:conversationError}=await s.from('conversations')
-          .select('*').eq('id',id).eq('user_id',user.id).single();
+          .select('id,title,model_id,created_at,updated_at').eq('id',id).eq('user_id',user.id).single();
         if(conversationError)throw appError('DATABASE_ERROR',{},conversationError);
 
         const {data:messages,error:messagesError}=await s.from('messages')
-          .select('*').eq('conversation_id',id).eq('user_id',user.id)
+          .select('id,role,content,model_id,token_usage,created_at').eq('conversation_id',id).eq('user_id',user.id)
           .order('created_at',{ascending:true});
         if(messagesError)throw appError('DATABASE_ERROR',{},messagesError);
 
@@ -106,7 +108,7 @@ export default async function handler(req,res){
         const messageIds=(messages||[]).map(message=>message.id);
         let images=[];
         if(messageIds.length){
-          const {data,error}=await s.from('generated_images').select('*')
+          const {data,error}=await s.from('generated_images').select('id,message_id,conversation_id,model_id,prompt,media_type,storage_status,fallback_reason,width,height,created_at')
             .eq('conversation_id',id).eq('user_id',user.id)
             .in('message_id',messageIds).order('created_at',{ascending:true});
           if(error)throw appError('DATABASE_ERROR',{},error);
@@ -115,8 +117,8 @@ export default async function handler(req,res){
 
         const hydratedImages=await Promise.all(images.map(async image=>{
           const output={...image};
-          if(output.storage_path||output.thumbnail_data||output.source_url){
-            const ticket=await createDownloadTicket({sub:user.id,imageId:output.id,kind:'image-view'},'2h');
+          if(output.storage_status!=='expired'){
+            const ticket=await createDownloadTicket({sub:user.id,imageId:output.id,kind:'image-view'},'10m');
             output.display_url=`/api/image?action=view&ticket=${encodeURIComponent(ticket)}`;
           }
           return output;

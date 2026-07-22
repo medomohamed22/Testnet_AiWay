@@ -1,5 +1,71 @@
-import { allowMethods, appError, chargeTokens, classifyTokenChargeFailure, cleanText, db, errorDetails, fetchWithTimeout, handleError, isLowBalance, json, localize, openRouterError, requestLocale, requireUser, ensureConversationOwner, normalizeRequestId, reserveAiTokens, finalizeAiTokens, releaseAiTokens, claimFreeDailyUse, createDownloadTicket, verifyDownloadTicket } from './_lib.js';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
+import { allowMethods, appError, chargeTokens, classifyTokenChargeFailure, cleanText, db, errorDetails, fetchWithTimeout, handleError, isLowBalance, json, localize, openRouterError, requestLocale, requireUser, ensureConversationOwner, normalizeRequestId, reserveAiTokens, finalizeAiTokens, releaseAiTokens, claimFreeDailyUse, createDownloadTicket, verifyDownloadTicket, enforceRateLimit, requestIp } from './_lib.js';
 
+
+const MAX_REMOTE_IMAGE_BYTES = 25 * 1024 * 1024;
+
+function isPrivateAddress(address) {
+  const value = String(address || '').toLowerCase();
+  if (value === '::1' || value.startsWith('fe80:') || value.startsWith('fc') || value.startsWith('fd')) return true;
+  const parts = value.split('.').map(Number);
+  if (parts.length === 4 && parts.every(n => Number.isInteger(n))) {
+    return parts[0] === 10 || parts[0] === 127 || parts[0] === 0 ||
+      (parts[0] === 169 && parts[1] === 254) ||
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+      (parts[0] === 192 && parts[1] === 168) || parts[0] >= 224;
+  }
+  return false;
+}
+
+async function assertPublicHttpsUrl(rawUrl) {
+  let url;
+  try { url = new URL(String(rawUrl || '')); } catch { throw appError('INVALID_IMAGE_REQUEST'); }
+  if (url.protocol !== 'https:' || url.username || url.password || url.port && url.port !== '443') throw appError('INVALID_IMAGE_REQUEST');
+  const host = url.hostname.toLowerCase();
+  if (host === 'localhost' || host.endsWith('.localhost')) throw appError('INVALID_IMAGE_REQUEST');
+  const addresses = isIP(host) ? [{ address: host }] : await lookup(host, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some(item => isPrivateAddress(item.address))) throw appError('INVALID_IMAGE_REQUEST');
+  return url;
+}
+
+async function readLimitedImage(response) {
+  const contentType = String(response.headers.get('content-type') || '').split(';')[0].toLowerCase();
+  if (!['image/jpeg','image/png','image/webp'].includes(contentType)) throw appError('INVALID_IMAGE_REQUEST');
+  const declared = Number(response.headers.get('content-length') || 0);
+  if (declared > MAX_REMOTE_IMAGE_BYTES) throw appError('ATTACHMENT_TOO_LARGE');
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > MAX_REMOTE_IMAGE_BYTES) throw appError('ATTACHMENT_TOO_LARGE');
+    return { buffer, contentType };
+  }
+  const chunks=[]; let total=0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_REMOTE_IMAGE_BYTES) { await reader.cancel(); throw appError('ATTACHMENT_TOO_LARGE'); }
+    chunks.push(Buffer.from(value));
+  }
+  return { buffer: Buffer.concat(chunks, total), contentType };
+}
+
+async function fetchRemoteImage(rawUrl) {
+  let current = await assertPublicHttpsUrl(rawUrl);
+  for (let redirect = 0; redirect < 4; redirect++) {
+    const response = await fetchWithTimeout(current.href, { redirect: 'manual', headers: { Accept: 'image/avif,image/webp,image/png,image/jpeg' } }, 30000);
+    if ([301,302,303,307,308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location) throw appError('EMPTY_RESPONSE');
+      current = await assertPublicHttpsUrl(new URL(location, current).href);
+      continue;
+    }
+    if (!response.ok) throw appError('EMPTY_RESPONSE');
+    return readLimitedImage(response);
+  }
+  throw appError('INVALID_IMAGE_REQUEST');
+}
 
 function isStorageCapacityError(error) {
   const text = String(error?.message || error?.error || error || '').toLowerCase();
@@ -42,16 +108,16 @@ async function cleanupExpiredImages(req, res) {
 
   const ids = rows.map(row => row.id).filter(Boolean);
   if (ids.length) {
-    const { error: deleteError } = await supabase
+    const { error: expireError } = await supabase
       .from('generated_images')
-      .delete()
+      .update({ storage_path: null, thumbnail_data: null, source_url: null, storage_status: 'expired', fallback_reason: 'expired_3_days' })
       .in('id', ids);
-    if (deleteError) throw deleteError;
+    if (expireError) throw expireError;
   }
 
   return json(res, 200, {
     success: true,
-    deletedRecords: ids.length,
+    expiredRecords: ids.length,
     deletedFiles: storagePaths.length,
     cutoff
   });
@@ -62,7 +128,7 @@ async function prepareImageDownload(req, res) {
   const imageId = cleanText(req.body?.imageId, 100);
   if (!imageId) throw appError('INVALID_REQUEST');
   const { data: image, error } = await db().from('generated_images').select('id').eq('id', imageId).eq('user_id', user.id).single();
-  if (error || !image) throw new Error('IMAGE_NOT_FOUND');
+  if (error || !image || image.storage_status === 'expired') throw new Error('IMAGE_NOT_FOUND');
   const ticket = await createDownloadTicket({ sub: user.id, imageId, kind: 'image' }, '2m');
   return json(res, 200, { url: `/api/image?action=native-download&ticket=${encodeURIComponent(ticket)}` });
 }
@@ -91,7 +157,7 @@ async function downloadImage(req, res, ticketed = false, inline = false) {
 
   const { data: image, error } = await db()
     .from('generated_images')
-    .select('id,media_type,thumbnail_data,storage_path,source_url,created_at')
+    .select('id,media_type,thumbnail_data,storage_path,source_url,storage_status,fallback_reason,created_at')
     .eq('id', imageId)
     .eq('user_id', user.id)
     .single();
@@ -114,11 +180,9 @@ async function downloadImage(req, res, ticketed = false, inline = false) {
     }
   }
   if (!file && image.source_url && /^https:\/\//i.test(String(image.source_url))) {
-    const remote = await fetchWithTimeout(String(image.source_url), {}, 30000);
-    if (remote.ok) {
-      file = Buffer.from(await remote.arrayBuffer());
-      mediaType = String(remote.headers.get('content-type') || mediaType).split(';')[0].trim().toLowerCase();
-    }
+    const remote = await fetchRemoteImage(String(image.source_url));
+    file = remote.buffer;
+    mediaType = remote.contentType;
   }
   if (!file?.length) throw new Error('IMAGE_NOT_FOUND');
   const extension = mediaType.includes('png') ? 'png' : mediaType.includes('webp') ? 'webp' : 'jpg';
@@ -258,13 +322,16 @@ export default async function handler(req, res) {
     if (action === 'persist') return await persistImage(req, res);
 
     const user = await requireUser(req);
+    const imageDb = db();
+    await enforceRateLimit(imageDb, `image:user:${user.id}`, 8, 60);
+    await enforceRateLimit(imageDb, `image:ip:${requestIp(req)}`, 20, 60);
     const { conversationId, prompt, referenceImage, modelId, aspectRatio = '1:1', resolution = '', requestId: rawRequestId } = req.body || {};
     const requestId=normalizeRequestId(rawRequestId); reservationUserId=user.id; reservationRequestId=requestId;
     const cleanPrompt = cleanText(prompt, 4000);
     const requestedAspectRatio = cleanText(aspectRatio, 20);
     if (!conversationId || !cleanPrompt) throw appError('INVALID_IMAGE_REQUEST');
 
-    const supabase = db(); reservationSupabase=supabase;
+    const supabase = imageDb; reservationSupabase=supabase;
     await ensureConversationOwner(supabase, conversationId, user.id);
     const { data: profile, error: profileError } = await supabase
       .from('users')
@@ -347,10 +414,9 @@ export default async function handler(req, res) {
     let thumbnailData = item?.b64_json ? `data:${mediaType};base64,${item.b64_json}` : null;
     const sourceUrl = /^https:\/\//i.test(String(item?.url || '')) ? String(item.url) : null;
     if (!thumbnailData && sourceUrl) {
-      const remoteImage = await fetchWithTimeout(sourceUrl, {}, 30000);
-      if (!remoteImage.ok) throw appError('EMPTY_RESPONSE');
-      const remoteBuffer = Buffer.from(await remoteImage.arrayBuffer());
-      thumbnailData = `data:${mediaType};base64,${remoteBuffer.toString('base64')}`;
+      const remoteImage = await fetchRemoteImage(sourceUrl);
+      mediaType = remoteImage.contentType;
+      thumbnailData = `data:${mediaType};base64,${remoteImage.buffer.toString('base64')}`;
     }
     const imageUsage = payload.usage?.cost ? payload.usage : { ...(payload.usage || {}), cost: estimatedCharge.providerUsd };
     const charge = chargeTokens({}, imageUsage, false);
@@ -405,7 +471,7 @@ export default async function handler(req, res) {
           aspectRatio: selectedAspectRatio || null,
           resolution: selectedResolution || null
         }
-      }).select('*').single();
+      }).select('id,message_id,conversation_id,model_id,prompt,media_type,thumbnail_data,source_url,storage_status,width,height,created_at').single();
       if (imageInsert.error || !imageInsert.data) throw appError('DATABASE_ERROR', {}, imageInsert.error);
       savedImage = imageInsert.data;
     } catch (saveError) {

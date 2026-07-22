@@ -4,18 +4,21 @@ import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const jwtSecret = process.env.APP_JWT_SECRET;
+const appJwtSecret = process.env.APP_SESSION_JWT_SECRET || process.env.APP_JWT_SECRET;
+const downloadJwtSecret = process.env.DOWNLOAD_JWT_SECRET || appJwtSecret;
+const adminJwtSecret = process.env.ADMIN_JWT_SECRET || appJwtSecret;
 const JWT_ISSUER = 'aiway';
 const APP_TOKEN_AUDIENCE = 'aiway-api';
 const ADMIN_TOKEN_AUDIENCE = 'aiway-admin';
 const DOWNLOAD_TOKEN_AUDIENCE = 'aiway-download';
-const APP_SESSION_TTL = '24h';
+const APP_SESSION_TTL = '12h';
+const SESSION_COOKIE = 'aiway_session';
 
 export function requireEnv() {
   const missing = [];
   if (!supabaseUrl) missing.push('SUPABASE_URL');
   if (!serviceRoleKey) missing.push('SUPABASE_SERVICE_ROLE_KEY');
-  if (!jwtSecret || jwtSecret.length < 32) missing.push('APP_JWT_SECRET');
+  if (!appJwtSecret || appJwtSecret.length < 32) missing.push('APP_SESSION_JWT_SECRET or APP_JWT_SECRET');
   if (missing.length) throw appError('MISSING_CONFIGURATION', { missing });
 }
 
@@ -122,6 +125,48 @@ export function allowMethods(req, res, methods) {
   return false;
 }
 
+
+function cookieValue(req, name) {
+  const raw = String(req?.headers?.cookie || '');
+  for (const part of raw.split(';')) {
+    const index = part.indexOf('=');
+    if (index < 0) continue;
+    const key = part.slice(0, index).trim();
+    if (key === name) return decodeURIComponent(part.slice(index + 1).trim());
+  }
+  return '';
+}
+
+export function setSessionCookie(res, token) {
+  const secure = process.env.NODE_ENV !== 'development';
+  const parts = [
+    `${SESSION_COOKIE}=${encodeURIComponent(String(token || ''))}`,
+    'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=43200'
+  ];
+  if (secure) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+export function clearSessionCookie(res) {
+  const secure = process.env.NODE_ENV !== 'development';
+  const parts = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+  if (secure) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function enforceSameOrigin(req) {
+  if (!['POST','PUT','PATCH','DELETE'].includes(String(req?.method || '').toUpperCase())) return;
+  const site = String(req?.headers?.['sec-fetch-site'] || '').toLowerCase();
+  if (site && !['same-origin','same-site','none'].includes(site)) throw appError('FORBIDDEN');
+  const origin = String(req?.headers?.origin || '').trim();
+  const host = String(req?.headers?.['x-forwarded-host'] || req?.headers?.host || '').split(',')[0].trim();
+  if (origin && host) {
+    let originHost = '';
+    try { originHost = new URL(origin).host; } catch { throw appError('FORBIDDEN'); }
+    if (originHost !== host) throw appError('FORBIDDEN');
+  }
+}
+
 export async function signAppToken(user) {
   requireEnv();
   return new SignJWT({ username: user.username, pi_uid: user.pi_uid, role: user.role })
@@ -131,7 +176,7 @@ export async function signAppToken(user) {
     .setSubject(user.id)
     .setIssuedAt()
     .setExpirationTime(APP_SESSION_TTL)
-    .sign(new TextEncoder().encode(jwtSecret));
+    .sign(new TextEncoder().encode(appJwtSecret));
 }
 
 export async function createDownloadTicket(payload, expiresIn = '2m') {
@@ -142,14 +187,14 @@ export async function createDownloadTicket(payload, expiresIn = '2m') {
     .setAudience(DOWNLOAD_TOKEN_AUDIENCE)
     .setIssuedAt()
     .setExpirationTime(expiresIn)
-    .sign(new TextEncoder().encode(jwtSecret));
+    .sign(new TextEncoder().encode(downloadJwtSecret));
 }
 
 export async function verifyDownloadTicket(token) {
   requireEnv();
   if (!token) throw appError('UNAUTHORIZED');
   try {
-    const { payload } = await jwtVerify(String(token), new TextEncoder().encode(jwtSecret), {
+    const { payload } = await jwtVerify(String(token), new TextEncoder().encode(downloadJwtSecret), {
       algorithms: ['HS256'],
       issuer: JWT_ISSUER,
       audience: DOWNLOAD_TOKEN_AUDIENCE
@@ -166,15 +211,17 @@ export async function requireUser(req) {
   requireEnv();
   const authorization = req.headers.authorization || '';
   const headerToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  const cookieToken = cookieValue(req, SESSION_COOKIE);
   // Native browser downloads cannot attach an Authorization header. For the two
   // attachment-only POST routes, the signed app token is sent in the HTTPS form body.
   const bodyToken = req.method === 'POST' && String(req.body?.action || '').startsWith('download-')
     ? String(req.body?.authToken || '')
     : '';
-  const token = headerToken || bodyToken;
+  const token = cookieToken || headerToken || bodyToken;
+  if (cookieToken) enforceSameOrigin(req);
   if (!token) throw appError('UNAUTHORIZED');
   try {
-    const { payload } = await jwtVerify(token, new TextEncoder().encode(jwtSecret), {
+    const { payload } = await jwtVerify(token, new TextEncoder().encode(appJwtSecret), {
       algorithms: ['HS256'],
       issuer: JWT_ISSUER,
       audience: APP_TOKEN_AUDIENCE
@@ -232,7 +279,7 @@ export async function signAdminToken(admin) {
     .setIssuer(JWT_ISSUER)
     .setAudience(ADMIN_TOKEN_AUDIENCE)
     .setSubject(admin.id).setIssuedAt().setExpirationTime('12h')
-    .sign(new TextEncoder().encode(jwtSecret));
+    .sign(new TextEncoder().encode(adminJwtSecret));
 }
 
 export async function requireAdminToken(req) {
@@ -241,7 +288,7 @@ export async function requireAdminToken(req) {
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
   if (!token) throw appError('UNAUTHORIZED');
   try {
-    const { payload } = await jwtVerify(token, new TextEncoder().encode(jwtSecret), {
+    const { payload } = await jwtVerify(token, new TextEncoder().encode(adminJwtSecret), {
       algorithms: ['HS256'],
       issuer: JWT_ISSUER,
       audience: ADMIN_TOKEN_AUDIENCE
@@ -908,7 +955,12 @@ export async function releaseAiTokens(supabase,userId,requestId,meta={}) {
 
 
 export function requestIp(req) {
-  return String(req?.headers?.['x-forwarded-for'] || req?.headers?.['x-real-ip'] || 'unknown').split(',')[0].trim().slice(0,80);
+  const candidates = [req?.headers?.['x-vercel-forwarded-for'], req?.headers?.['x-real-ip'], req?.socket?.remoteAddress];
+  for (const candidate of candidates) {
+    const value = String(candidate || '').split(',')[0].trim();
+    if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(value) || /^[0-9a-f:]+$/i.test(value)) return value.slice(0,80);
+  }
+  return 'unknown';
 }
 export async function enforceRateLimit(supabase,bucket,limit,windowSeconds) {
   const {data,error}=await supabase.rpc('check_api_rate_limit',{p_bucket:String(bucket).slice(0,180),p_limit:limit,p_window_seconds:windowSeconds});
