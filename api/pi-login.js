@@ -193,7 +193,7 @@ export default async function handler(req, res) {
       if (userError || !user) throw appError('DATABASE_ERROR', {}, userError);
       const token = await signAppToken(user);
       setSessionCookie(res, token);
-      return json(res, 200, { user, session: true });
+      return json(res, 200, { user, session: true, sessionToken: token });
     }
 
     await enforceRateLimit(supabase, `login:${ip}`, 10, 60);
@@ -206,7 +206,7 @@ export default async function handler(req, res) {
     const user = await upsertPiUser(supabase, piUid, username);
     const token = await signAppToken(user);
     setSessionCookie(res, token);
-    return json(res, 200, { user, session: true });
+    return json(res, 200, { user, session: true, sessionToken: token });
   } catch (error) {
     if (error?.name === 'AbortError') return handleError(appError('REQUEST_TIMEOUT', {}, error), res, localize(locale, 'انتهت مهلة تسجيل الدخول. حاول مرة أخرى.', 'Sign-in timed out. Try again.'), locale);
     if (error?.code === 'PI_LOGIN_BRIDGE_EXPIRED') return json(res, 410, {
