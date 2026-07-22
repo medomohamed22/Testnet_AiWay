@@ -141,7 +141,7 @@ export function setSessionCookie(res, token) {
   const secure = process.env.NODE_ENV !== 'development';
   const parts = [
     `${SESSION_COOKIE}=${encodeURIComponent(String(token || ''))}`,
-    'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=43200'
+    'Path=/', 'HttpOnly', 'SameSite=None', 'Max-Age=43200'
   ];
   if (secure) parts.push('Secure');
   res.setHeader('Set-Cookie', parts.join('; '));
@@ -149,7 +149,7 @@ export function setSessionCookie(res, token) {
 
 export function clearSessionCookie(res) {
   const secure = process.env.NODE_ENV !== 'development';
-  const parts = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+  const parts = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=None', 'Max-Age=0'];
   if (secure) parts.push('Secure');
   res.setHeader('Set-Cookie', parts.join('; '));
 }
