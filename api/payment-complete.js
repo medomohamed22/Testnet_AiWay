@@ -1,4 +1,4 @@
-import { allowMethods, appError, db, fetchWithTimeout, handleError, json, localize, PACKAGES, piApiError, requestLocale, requireUser, requestIp, enforceRateLimit, sendTelegramNotification, telegramHtml, formatCairoDateTime } from './_lib.js';
+import { allowMethods, appError, db, fetchWithTimeout, handleError, json, localize, getConfiguredPackages, piApiError, requestLocale, requireUser, requestIp, enforceRateLimit, sendTelegramNotification, telegramHtml, formatCairoDateTime } from './_lib.js';
 
 const piHeaders=()=>({Authorization:`Key ${process.env.PI_SECRET_KEY}`,'Content-Type':'application/json'});
 async function piRequest(paymentId,action='',body){
@@ -52,6 +52,7 @@ export default async function handler(req,res){
     if(!process.env.PI_SECRET_KEY)throw appError('MISSING_CONFIGURATION');
 
     const supabase=db();
+    const packages=await getConfiguredPackages();
     let remote=await piRequest(paymentId);
     const remoteOwner=owner(remote);
     if(!remoteOwner||remoteOwner!==norm(user.pi_uid))mismatch('PI_OWNER',{paymentId,remoteOwner,currentPiUid:user.pi_uid});
@@ -82,9 +83,10 @@ export default async function handler(req,res){
     if(payment.status==='completed')return json(res,200,{completed:true,resolved:true,tokens:payment.ai_tokens,alreadyCompleted:true});
 
     const remotePackage=pkg(remote);
-    if(remotePackage!==norm(payment.package_id)||!PACKAGES[remotePackage])mismatch('PACKAGE',{paymentId,remotePackage,storedPackage:payment.package_id});
+    if(remotePackage!==norm(payment.package_id)||!packages[remotePackage])mismatch('PACKAGE',{paymentId,remotePackage,storedPackage:payment.package_id});
     if(!closeEnough(remote.amount,payment.amount_pi))mismatch('AMOUNT',{paymentId,remoteAmount:remote.amount,storedAmount:payment.amount_pi});
-    if(Number(payment.ai_tokens)!==Number(PACKAGES[remotePackage].tokens))mismatch('TOKENS',{paymentId,storedTokens:payment.ai_tokens,expectedTokens:PACKAGES[remotePackage].tokens});
+    const remoteTokens=Number(remote?.metadata?.tokens||payment.ai_tokens);
+    if(remoteTokens!==Number(payment.ai_tokens))mismatch('TOKENS',{paymentId,remoteTokens,storedTokens:payment.ai_tokens});
 
     const remoteTx=verifiedTransaction(remote);
     if(!remoteTx)throw appError('PAYMENT_PENDING');

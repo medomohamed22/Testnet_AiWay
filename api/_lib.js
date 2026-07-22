@@ -4,21 +4,18 @@ import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const appJwtSecret = process.env.APP_SESSION_JWT_SECRET || process.env.APP_JWT_SECRET;
-const downloadJwtSecret = process.env.DOWNLOAD_JWT_SECRET || appJwtSecret;
-const adminJwtSecret = process.env.ADMIN_JWT_SECRET || appJwtSecret;
+const jwtSecret = process.env.APP_JWT_SECRET;
 const JWT_ISSUER = 'aiway';
 const APP_TOKEN_AUDIENCE = 'aiway-api';
 const ADMIN_TOKEN_AUDIENCE = 'aiway-admin';
 const DOWNLOAD_TOKEN_AUDIENCE = 'aiway-download';
-const APP_SESSION_TTL = '12h';
-const SESSION_COOKIE = 'aiway_session';
+const APP_SESSION_TTL = '24h';
 
 export function requireEnv() {
   const missing = [];
   if (!supabaseUrl) missing.push('SUPABASE_URL');
   if (!serviceRoleKey) missing.push('SUPABASE_SERVICE_ROLE_KEY');
-  if (!appJwtSecret || appJwtSecret.length < 32) missing.push('APP_SESSION_JWT_SECRET or APP_JWT_SECRET');
+  if (!jwtSecret || jwtSecret.length < 32) missing.push('APP_JWT_SECRET');
   if (missing.length) throw appError('MISSING_CONFIGURATION', { missing });
 }
 
@@ -125,48 +122,6 @@ export function allowMethods(req, res, methods) {
   return false;
 }
 
-
-function cookieValue(req, name) {
-  const raw = String(req?.headers?.cookie || '');
-  for (const part of raw.split(';')) {
-    const index = part.indexOf('=');
-    if (index < 0) continue;
-    const key = part.slice(0, index).trim();
-    if (key === name) return decodeURIComponent(part.slice(index + 1).trim());
-  }
-  return '';
-}
-
-export function setSessionCookie(res, token) {
-  const secure = process.env.NODE_ENV !== 'development';
-  const parts = [
-    `${SESSION_COOKIE}=${encodeURIComponent(String(token || ''))}`,
-    'Path=/', 'HttpOnly', 'SameSite=None', 'Max-Age=43200'
-  ];
-  if (secure) parts.push('Secure');
-  res.setHeader('Set-Cookie', parts.join('; '));
-}
-
-export function clearSessionCookie(res) {
-  const secure = process.env.NODE_ENV !== 'development';
-  const parts = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=None', 'Max-Age=0'];
-  if (secure) parts.push('Secure');
-  res.setHeader('Set-Cookie', parts.join('; '));
-}
-
-function enforceSameOrigin(req) {
-  if (!['POST','PUT','PATCH','DELETE'].includes(String(req?.method || '').toUpperCase())) return;
-  const site = String(req?.headers?.['sec-fetch-site'] || '').toLowerCase();
-  if (site && !['same-origin','same-site','none'].includes(site)) throw appError('FORBIDDEN');
-  const origin = String(req?.headers?.origin || '').trim();
-  const host = String(req?.headers?.['x-forwarded-host'] || req?.headers?.host || '').split(',')[0].trim();
-  if (origin && host) {
-    let originHost = '';
-    try { originHost = new URL(origin).host; } catch { throw appError('FORBIDDEN'); }
-    if (originHost !== host) throw appError('FORBIDDEN');
-  }
-}
-
 export async function signAppToken(user) {
   requireEnv();
   return new SignJWT({ username: user.username, pi_uid: user.pi_uid, role: user.role })
@@ -176,7 +131,7 @@ export async function signAppToken(user) {
     .setSubject(user.id)
     .setIssuedAt()
     .setExpirationTime(APP_SESSION_TTL)
-    .sign(new TextEncoder().encode(appJwtSecret));
+    .sign(new TextEncoder().encode(jwtSecret));
 }
 
 export async function createDownloadTicket(payload, expiresIn = '2m') {
@@ -187,14 +142,14 @@ export async function createDownloadTicket(payload, expiresIn = '2m') {
     .setAudience(DOWNLOAD_TOKEN_AUDIENCE)
     .setIssuedAt()
     .setExpirationTime(expiresIn)
-    .sign(new TextEncoder().encode(downloadJwtSecret));
+    .sign(new TextEncoder().encode(jwtSecret));
 }
 
 export async function verifyDownloadTicket(token) {
   requireEnv();
   if (!token) throw appError('UNAUTHORIZED');
   try {
-    const { payload } = await jwtVerify(String(token), new TextEncoder().encode(downloadJwtSecret), {
+    const { payload } = await jwtVerify(String(token), new TextEncoder().encode(jwtSecret), {
       algorithms: ['HS256'],
       issuer: JWT_ISSUER,
       audience: DOWNLOAD_TOKEN_AUDIENCE
@@ -211,49 +166,35 @@ export async function requireUser(req) {
   requireEnv();
   const authorization = req.headers.authorization || '';
   const headerToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
-  // Authentication is intentionally cookie-free. Pi Browser WebViews can block,
-  // replay, or isolate cookies, so protected API routes accept only an explicit
-  // app token from the Authorization header. The body token remains limited to
-  // signed native-download POST requests that cannot attach custom headers.
+  // Native browser downloads cannot attach an Authorization header. For the two
+  // attachment-only POST routes, the signed app token is sent in the HTTPS form body.
   const bodyToken = req.method === 'POST' && String(req.body?.action || '').startsWith('download-')
     ? String(req.body?.authToken || '')
     : '';
   const token = headerToken || bodyToken;
   if (!token) throw appError('UNAUTHORIZED');
-  let payload;
   try {
-    ({ payload } = await jwtVerify(token, new TextEncoder().encode(appJwtSecret), {
+    const { payload } = await jwtVerify(token, new TextEncoder().encode(jwtSecret), {
       algorithms: ['HS256'],
       issuer: JWT_ISSUER,
       audience: APP_TOKEN_AUDIENCE
-    }));
+    });
+    if (!payload.sub) throw appError('UNAUTHORIZED');
+
+    // Never trust authorization-relevant claims from a stale token. Confirm that the
+    // account still exists and read the current role from the database on every request.
+    const { data: currentUser, error } = await db()
+      .from('users')
+      .select('id,username,pi_uid,role,is_banned')
+      .eq('id', payload.sub)
+      .maybeSingle();
+    if (error || !currentUser) throw appError('UNAUTHORIZED');
+    if (currentUser.is_banned) throw appError('ACCOUNT_BANNED');
+    return currentUser;
   } catch (error) {
+    if (error?.code === 'UNAUTHORIZED') throw error;
     throw appError('UNAUTHORIZED', {}, error);
   }
-  if (!payload?.sub) throw appError('UNAUTHORIZED');
-
-  // Confirm the account still exists. A real database/configuration failure must not
-  // be disguised as UNAUTHORIZED, otherwise a valid Pi login appears to have failed.
-  const supabase = db();
-  const { data: currentUser, error: userError } = await supabase
-    .from('users')
-    .select('id,username,pi_uid,role')
-    .eq('id', payload.sub)
-    .maybeSingle();
-  if (userError) throw appError('DATABASE_ERROR', {}, userError);
-  if (!currentUser) throw appError('UNAUTHORIZED');
-
-  // Token-expiry maintenance is not authentication. Older/incompletely migrated
-  // databases may not yet contain this RPC (or its grant), so do not reject a valid
-  // signed-in user because this optional maintenance step failed.
-  const { error: expiryError } = await supabase.rpc('expire_user_tokens', { p_user_id: currentUser.id });
-  if (expiryError) {
-    console.warn('[TOKEN_EXPIRY_MAINTENANCE_SKIPPED]', {
-      code: expiryError.code || '',
-      message: expiryError.message || ''
-    });
-  }
-  return currentUser;
 }
 
 export async function requireAdmin(user) {
@@ -286,7 +227,7 @@ export async function signAdminToken(admin) {
     .setIssuer(JWT_ISSUER)
     .setAudience(ADMIN_TOKEN_AUDIENCE)
     .setSubject(admin.id).setIssuedAt().setExpirationTime('12h')
-    .sign(new TextEncoder().encode(adminJwtSecret));
+    .sign(new TextEncoder().encode(jwtSecret));
 }
 
 export async function requireAdminToken(req) {
@@ -295,7 +236,7 @@ export async function requireAdminToken(req) {
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
   if (!token) throw appError('UNAUTHORIZED');
   try {
-    const { payload } = await jwtVerify(token, new TextEncoder().encode(adminJwtSecret), {
+    const { payload } = await jwtVerify(token, new TextEncoder().encode(jwtSecret), {
       algorithms: ['HS256'],
       issuer: JWT_ISSUER,
       audience: ADMIN_TOKEN_AUDIENCE
@@ -584,20 +525,66 @@ export function handleError(error, res, fallback = 'Server error', locale = 'ar'
   return json(res, 500, { error: fallback, code: 'SERVER_ERROR' });
 }
 
-// Each AiWay Token represents $0.00001 of provider capacity.
-// Customers receive provider capacity equal to 50% of what they pay:
-// $1 => $0.50 capacity => 50,000 AiWay Tokens.
+// كل AiWay Token يمثل 0.00001 دولار من تكلفة المزود الفعلية.
+// كل AiWay Token يغطي 0.00001 دولار من تكلفة OpenRouter الفعلية.
+// الباقات تقسم قيمة الدفع 50/50: نصف القيمة رصيد استخدام للمستخدم ونصفها ربح إجمالي للمنصة.
+// لا يدخل معامل الربح في خصم الاستخدام؛ الخصم يظل providerUsd / TOKEN_USD فقط.
 export const TOKEN_USD = 0.00001;
 export const MARKUP = 2;
 export const TRIAL_MESSAGE_LIMIT = 5;
 export const TRIAL_TOKENS = 1500;
 export const TRIAL_MODEL_FALLBACK = 'google/gemma-4-26b-a4b-it:free';
-const tokensForUsd = usd => Math.round((Number(usd) * 0.5) / TOKEN_USD);
+const tokensForUsd = usd => Math.round(Number(usd) / MARKUP / TOKEN_USD);
 export const PACKAGES = {
   starter: { usd: 1, tokens: tokensForUsd(1) },
   plus: { usd: 5, tokens: tokensForUsd(5) },
   pro: { usd: 10, tokens: tokensForUsd(10) }
 };
+
+const DEFAULT_ADMIN_CONFIG = {
+  packages: PACKAGES,
+  categories: [
+    { id: 'recommended', ar: 'مختارة لك', en: 'Recommended', order: 1 },
+    { id: 'free', ar: 'مجانية', en: 'Free', order: 2 },
+    { id: 'cheap', ar: 'الأرخص', en: 'Lowest cost', order: 3 },
+    { id: 'premium', ar: 'الأقوى', en: 'Premium', order: 4 },
+    { id: 'images', ar: 'إنشاء الصور', en: 'Image generation', order: 5 }
+  ],
+  models: {}
+};
+let adminConfigCache = { at: 0, value: DEFAULT_ADMIN_CONFIG };
+export async function getAdminConfig({ fresh = false } = {}) {
+  if (!fresh && Date.now() - adminConfigCache.at < 30000) return adminConfigCache.value;
+  try {
+    const { data, error } = await db().from('app_settings').select('value').eq('key', 'admin_catalog').maybeSingle();
+    if (error) throw error;
+    const raw = data?.value && typeof data.value === 'object' ? data.value : {};
+    const value = {
+      packages: { ...PACKAGES, ...(raw.packages || {}) },
+      categories: Array.isArray(raw.categories) && raw.categories.length ? raw.categories : DEFAULT_ADMIN_CONFIG.categories,
+      models: raw.models && typeof raw.models === 'object' ? raw.models : {}
+    };
+    adminConfigCache = { at: Date.now(), value };
+    return value;
+  } catch (error) {
+    console.warn('Using default admin catalog settings:', error?.message || error);
+    return adminConfigCache.value;
+  }
+}
+export async function saveAdminConfig(value) {
+  const normalized = {
+    packages: { ...PACKAGES, ...(value?.packages || {}) },
+    categories: Array.isArray(value?.categories) ? value.categories : DEFAULT_ADMIN_CONFIG.categories,
+    models: value?.models && typeof value.models === 'object' ? value.models : {}
+  };
+  const { error } = await db().from('app_settings').upsert({ key: 'admin_catalog', value: normalized, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) throw appError('DATABASE_ERROR', {}, error);
+  adminConfigCache = { at: Date.now(), value: normalized };
+  return normalized;
+}
+export async function getConfiguredPackages() {
+  return (await getAdminConfig()).packages;
+}
 
 const FAMILY_CONFIG = [
   { key: 'chatgpt', label: 'ChatGPT', prefix: 'openai/', tag: 'OpenAI' },
@@ -664,7 +651,7 @@ function normalizeModel(model, family) {
   };
 }
 
-export async function getAvailableModels() {
+export async function getOpenRouterCatalog() {
   if (Date.now() - catalogCache.at < 60 * 60 * 1000 && catalogCache.models.length >= 20) return catalogCache.models;
   try {
     const response = await fetchWithTimeout('https://openrouter.ai/api/v1/models', {
@@ -672,37 +659,33 @@ export async function getAvailableModels() {
     }, 15000);
     if (!response.ok) throw new Error(`OpenRouter models ${response.status}`);
     const payload = await response.json();
-    const selected = [];
-    for (const family of FAMILY_CONFIG) {
-      const familyModels = (payload.data || [])
-        .filter(model => {
-          if (!String(model.id || '').startsWith(family.prefix) || !isTextChatModel(model)) return false;
-          const promptPrice = Number(model.pricing?.prompt || 0);
-          const completionPrice = Number(model.pricing?.completion || 0);
-          const isZeroCost = promptPrice === 0 && completionPrice === 0;
-          return model.id === TRIAL_MODEL_FALLBACK || !isZeroCost;
-        })
-        .map(model => normalizeModel(model, family))
-        .sort((a, b) => b.created - a.created || a.name.localeCompare(b.name))
-        .slice(0, 5);
-      selected.push(...familyModels);
-    }
-    if (selected.length < FAMILY_CONFIG.length * 5) throw new Error('Incomplete OpenRouter catalog');
-    const trialFromPayload = (payload.data || []).find(model => model.id === TRIAL_MODEL_FALLBACK);
-    const trialModel = trialFromPayload
-      ? normalizeModel(trialFromPayload, FAMILY_CONFIG.find(family => family.key === 'gemini'))
-      : FALLBACK_MODELS.find(model => model.id === TRIAL_MODEL_FALLBACK);
-    if (trialModel && !selected.some(model => model.id === TRIAL_MODEL_FALLBACK)) {
-      const googleIndex = selected.findIndex(model => model.family === 'gemini');
-      selected.splice(googleIndex >= 0 ? googleIndex : 0, 0, trialModel);
-    }
-    // Only the official Gemma trial model is exposed as free.
-    catalogCache = { at: Date.now(), models: selected };
-    return selected;
+    const all = (payload.data || []).filter(isTextChatModel).map(model => {
+      const provider = String(model.id || '').split('/')[0] || 'other';
+      const known = FAMILY_CONFIG.find(f => String(model.id || '').startsWith(f.prefix));
+      return normalizeModel(model, known || { key: provider, label: provider, tag: provider });
+    }).sort((a,b) => {
+      const ac=(Number(a.pricing?.prompt)||0)+(Number(a.pricing?.completion)||0);
+      const bc=(Number(b.pricing?.prompt)||0)+(Number(b.pricing?.completion)||0);
+      return ac-bc || String(a.name).localeCompare(String(b.name));
+    });
+    if (!all.length) throw new Error('Empty OpenRouter catalog');
+    catalogCache = { at: Date.now(), models: all };
+    return all;
   } catch (error) {
     console.warn('Using fallback model catalog:', error.message);
     return catalogCache.models;
   }
+}
+
+export async function getAvailableModels() {
+  const [catalog, config] = await Promise.all([getOpenRouterCatalog(), getAdminConfig()]);
+  const configuredIds = Object.keys(config.models || {});
+  if (!configuredIds.length) return catalog.filter(m => FAMILY_CONFIG.some(f => m.id.startsWith(f.prefix))).slice(0, 30);
+  return catalog.filter(model => config.models?.[model.id]?.visible).map(model => {
+    const setting = config.models[model.id] || {};
+    const category = config.categories.find(c => c.id === setting.categoryId);
+    return { ...model, categoryId: setting.categoryId || 'recommended', categoryLabel: category?.ar || 'مختارة لك', displayOrder: Number(setting.order || 9999) };
+  }).sort((a,b)=>a.displayOrder-b.displayOrder || a.name.localeCompare(b.name));
 }
 
 export function isFreeModel(model) {
@@ -915,7 +898,7 @@ export async function getPiUsd() {
 }
 
 export async function packageQuote(id) {
-  const pack = PACKAGES[id];
+  const pack = (await getConfiguredPackages())[id];
   if (!pack) return null;
   const piUsd = await getPiUsd();
   return { ...pack, piUsd, amountPi: Number((pack.usd / piUsd).toFixed(7)), quotedAt: new Date().toISOString() };
@@ -962,12 +945,7 @@ export async function releaseAiTokens(supabase,userId,requestId,meta={}) {
 
 
 export function requestIp(req) {
-  const candidates = [req?.headers?.['x-vercel-forwarded-for'], req?.headers?.['x-real-ip'], req?.socket?.remoteAddress];
-  for (const candidate of candidates) {
-    const value = String(candidate || '').split(',')[0].trim();
-    if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(value) || /^[0-9a-f:]+$/i.test(value)) return value.slice(0,80);
-  }
-  return 'unknown';
+  return String(req?.headers?.['x-forwarded-for'] || req?.headers?.['x-real-ip'] || 'unknown').split(',')[0].trim().slice(0,80);
 }
 export async function enforceRateLimit(supabase,bucket,limit,windowSeconds) {
   const {data,error}=await supabase.rpc('check_api_rate_limit',{p_bucket:String(bucket).slice(0,180),p_limit:limit,p_window_seconds:windowSeconds});

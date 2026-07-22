@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { allowMethods, appError, db, handleError, json, localize, piApiError, requestLocale, signAppToken, requestIp, enforceRateLimit, setSessionCookie, clearSessionCookie } from './_lib.js';
+import { allowMethods, appError, db, handleError, json, localize, piApiError, requestLocale, signAppToken, requestIp, enforceRateLimit } from './_lib.js';
 
 const BRIDGE_TTL_MS = 10 * 60 * 1000;
 
@@ -18,7 +18,7 @@ function safeEqualHex(a, b) {
 }
 
 function bridgeStateSignature(requestId) {
-  const secret = String(process.env.PI_BRIDGE_HMAC_SECRET || process.env.APP_JWT_SECRET || '');
+  const secret = String(process.env.APP_JWT_SECRET || '');
   if (!secret) throw appError('SERVER_CONFIG_ERROR');
   return createHmac('sha256', secret)
     .update(`${requestId}:pi-signin-state`)
@@ -43,7 +43,7 @@ function parseBridgeState(value) {
 }
 
 function exchangeCode(requestId, pollToken) {
-  const secret = String(process.env.PI_BRIDGE_HMAC_SECRET || process.env.APP_JWT_SECRET || '');
+  const secret = String(process.env.APP_JWT_SECRET || '');
   return createHmac('sha256', secret).update(`${requestId}:${pollToken}:pi-login-bridge`).digest('base64url');
 }
 
@@ -75,9 +75,10 @@ async function upsertPiUser(supabase, piUid, username) {
   const { data: user, error } = await supabase
     .from('users')
     .upsert({ pi_uid: piUid, username, last_login_at: new Date().toISOString() }, { onConflict: 'pi_uid' })
-    .select('id, pi_uid, username, role, ai_tokens, trial_messages_remaining, has_purchased, created_at')
+    .select('id, pi_uid, username, role, is_banned, ai_tokens, trial_messages_remaining, has_purchased, created_at')
     .single();
   if (error || !user) throw appError('DATABASE_ERROR', {}, error);
+  if (user.is_banned) throw appError('ACCOUNT_BANNED');
   return user;
 }
 
@@ -102,8 +103,6 @@ export default async function handler(req, res) {
     const supabase = db();
     const ip = requestIp(req);
     const action = String(req.body?.action || 'login').trim();
-
-    if (action === 'logout') { clearSessionCookie(res); return json(res, 200, { loggedOut: true }); }
 
     if (action === 'bridge-start') {
       await enforceRateLimit(supabase, `pi-bridge-start:${ip}`, 8, 60);
@@ -187,13 +186,13 @@ export default async function handler(req, res) {
       if (!consumed?.user_id) throw appError('PI_LOGIN_BRIDGE_EXPIRED');
       const { data: user, error: userError } = await supabase
         .from('users')
-        .select('id, pi_uid, username, role, ai_tokens, trial_messages_remaining, has_purchased, created_at')
+        .select('id, pi_uid, username, role, is_banned, ai_tokens, trial_messages_remaining, has_purchased, created_at')
         .eq('id', consumed.user_id)
         .single();
       if (userError || !user) throw appError('DATABASE_ERROR', {}, userError);
+      if (user.is_banned) throw appError('ACCOUNT_BANNED');
       const token = await signAppToken(user);
-      setSessionCookie(res, token);
-      return json(res, 200, { user, session: true, sessionToken: token });
+      return json(res, 200, { token, user });
     }
 
     await enforceRateLimit(supabase, `login:${ip}`, 10, 60);
@@ -205,10 +204,7 @@ export default async function handler(req, res) {
     const { piUid, username } = await verifyPiAccessToken(accessToken);
     const user = await upsertPiUser(supabase, piUid, username);
     const token = await signAppToken(user);
-    // Direct sign-in inside Pi Browser is bearer-token only. Do not create a
-    // browser cookie here because Pi's WebView may retain, block, or replay it.
-    // Cookie sessions remain available only for the external-browser bridge.
-    return json(res, 200, { user, session: true, sessionToken: token, authMode: 'bearer' });
+    return json(res, 200, { token, user });
   } catch (error) {
     if (error?.name === 'AbortError') return handleError(appError('REQUEST_TIMEOUT', {}, error), res, localize(locale, 'انتهت مهلة تسجيل الدخول. حاول مرة أخرى.', 'Sign-in timed out. Try again.'), locale);
     if (error?.code === 'PI_LOGIN_BRIDGE_EXPIRED') return json(res, 410, {

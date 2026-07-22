@@ -1,4 +1,4 @@
-import { allowMethods, db, estimateChatCharge, fetchWithTimeout, getAvailableModels, getTrialModelId, json, localize, MARKUP, PACKAGES, packageQuote, requestLocale, requireUser, TOKEN_USD } from './_lib.js';
+import { allowMethods, db, estimateChatCharge, fetchWithTimeout, getAvailableModels, getTrialModelId, getAdminConfig, getConfiguredPackages, json, localize, MARKUP, packageQuote, requestLocale, requireUser, TOKEN_USD } from './_lib.js';
 
 const IMAGE_PROVIDER_ORDER = ['x-ai', 'openai', 'google', 'bytedance-seed', 'black-forest-labs', 'stability-ai', 'recraft', 'ideogram'];
 const IMAGE_PROVIDER_LABELS = { 'x-ai':'xAI · Grok Imagine',
@@ -201,7 +201,9 @@ export default async function handler(req, res) {
       unlocked = Boolean(data?.has_purchased);
     } catch {}
 
-    const [catalog, imageCatalog, trialModelId] = await Promise.all([getAvailableModels(), getImageModels(), getTrialModelId()]);
+    const [catalog, rawImageCatalog, trialModelId, config, configuredPackages] = await Promise.all([getAvailableModels(), getImageModels(), getTrialModelId(), getAdminConfig(), getConfiguredPackages()]);
+    const hasConfiguredModels=Object.keys(config.models||{}).length>0;
+    const imageCatalog = rawImageCatalog.filter(model => !hasConfiguredModels || config.models?.[model.id]?.visible).map(model => { const setting=config.models[model.id]||{}; const category=config.categories.find(c=>c.id===setting.categoryId); return {...model,categoryId:setting.categoryId||'images',categoryLabel:category?.ar||'إنشاء الصور',displayOrder:Number(setting.order||9999)}; }).sort((a,b)=>a.displayOrder-b.displayOrder||compareImageCostAsc(a,b));
     const normalizedModels = catalog.map(model => ({
       id: model.id,
       name: model.name,
@@ -231,9 +233,9 @@ export default async function handler(req, res) {
 
     const packages = {};
     try {
-      for (const id of Object.keys(PACKAGES)) packages[id] = await packageQuote(id);
+      for (const id of Object.keys(configuredPackages)) packages[id] = await packageQuote(id);
     } catch {
-      for (const [id, pack] of Object.entries(PACKAGES)) packages[id] = { ...pack, amountPi: null };
+      for (const [id, pack] of Object.entries(configuredPackages)) packages[id] = { ...pack, amountPi: null };
     }
 
     return json(res, 200, {
@@ -242,6 +244,7 @@ export default async function handler(req, res) {
       chatModelOrders,
       trialModelId,
       packages,
+      categories: config.categories,
       imageModels: imageCatalog.map(model => {
         const pricingValues = [model.pricing?.image, model.pricing?.image_output, model.pricing?.request]
           .filter(value => value !== undefined && value !== null && value !== '')
