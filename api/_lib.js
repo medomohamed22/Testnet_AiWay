@@ -183,16 +183,25 @@ export async function requireUser(req) {
 
     // Never trust authorization-relevant claims from a stale token. Confirm that the
     // account still exists and read the current role from the database on every request.
-    const { data: currentUser, error } = await db()
+    const client = db();
+    const { data: currentUser, error } = await client
       .from('users')
-      .select('id,username,pi_uid,role,is_banned')
+      .select('id,username,pi_uid,role')
       .eq('id', payload.sub)
       .maybeSingle();
     if (error || !currentUser) throw appError('UNAUTHORIZED');
+
+    const { data: banRow, error: banError } = await client
+      .from('users')
+      .select('is_banned')
+      .eq('id', payload.sub)
+      .maybeSingle();
+    if (banError && banError.code !== '42703') throw appError('UNAUTHORIZED');
+    currentUser.is_banned = Boolean(banRow?.is_banned);
     if (currentUser.is_banned) throw appError('ACCOUNT_BANNED');
     return currentUser;
   } catch (error) {
-    if (error?.code === 'UNAUTHORIZED') throw error;
+    if (error?.code === 'UNAUTHORIZED' || error?.code === 'ACCOUNT_BANNED') throw error;
     throw appError('UNAUTHORIZED', {}, error);
   }
 }

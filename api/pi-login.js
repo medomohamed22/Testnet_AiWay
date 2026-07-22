@@ -72,12 +72,35 @@ async function verifyPiAccessToken(accessToken) {
 }
 
 async function upsertPiUser(supabase, piUid, username) {
+  const baseFields = 'id, pi_uid, username, role, ai_tokens, trial_messages_remaining, has_purchased, created_at';
   const { data: user, error } = await supabase
     .from('users')
     .upsert({ pi_uid: piUid, username, last_login_at: new Date().toISOString() }, { onConflict: 'pi_uid' })
-    .select('id, pi_uid, username, role, is_banned, ai_tokens, trial_messages_remaining, has_purchased, created_at')
+    .select(baseFields)
     .single();
   if (error || !user) throw appError('DATABASE_ERROR', {}, error);
+
+  // Keep sign-in available when the admin-control migration has not been applied yet.
+  // Once is_banned exists, it is still enforced before issuing a session.
+  const { data: banRow, error: banError } = await supabase
+    .from('users')
+    .select('is_banned')
+    .eq('id', user.id)
+    .maybeSingle();
+  if (banError && banError.code !== '42703') throw appError('DATABASE_ERROR', {}, banError);
+  user.is_banned = Boolean(banRow?.is_banned);
+  if (user.is_banned) throw appError('ACCOUNT_BANNED');
+  return user;
+}
+
+
+async function readPiUserById(supabase, userId) {
+  const baseFields = 'id, pi_uid, username, role, ai_tokens, trial_messages_remaining, has_purchased, created_at';
+  const { data: user, error } = await supabase.from('users').select(baseFields).eq('id', userId).single();
+  if (error || !user) throw appError('DATABASE_ERROR', {}, error);
+  const { data: banRow, error: banError } = await supabase.from('users').select('is_banned').eq('id', userId).maybeSingle();
+  if (banError && banError.code !== '42703') throw appError('DATABASE_ERROR', {}, banError);
+  user.is_banned = Boolean(banRow?.is_banned);
   if (user.is_banned) throw appError('ACCOUNT_BANNED');
   return user;
 }
@@ -184,13 +207,7 @@ export default async function handler(req, res) {
         .maybeSingle();
       if (consumeError) throw appError('DATABASE_ERROR', {}, consumeError);
       if (!consumed?.user_id) throw appError('PI_LOGIN_BRIDGE_EXPIRED');
-      const { data: user, error: userError } = await supabase
-        .from('users')
-        .select('id, pi_uid, username, role, is_banned, ai_tokens, trial_messages_remaining, has_purchased, created_at')
-        .eq('id', consumed.user_id)
-        .single();
-      if (userError || !user) throw appError('DATABASE_ERROR', {}, userError);
-      if (user.is_banned) throw appError('ACCOUNT_BANNED');
+      const user = await readPiUserById(supabase, consumed.user_id);
       const token = await signAppToken(user);
       return json(res, 200, { token, user });
     }
