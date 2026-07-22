@@ -148,9 +148,6 @@ async function readProviderFailure(response) {
 
 
 const AGENT_PLAN_MARKER = 'AIWAY_AGENT_PLAN';
-const isFreeGemmaModel = model => Boolean(
-  model && isFreeModel(model) && /gemma/i.test(`${model.id || ''} ${model.name || ''} ${model.shortName || ''}`)
-);
 
 function encodeAgentPlan(plan) {
   return Buffer.from(String(plan || ''), 'utf8').toString('base64url');
@@ -199,7 +196,7 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') throw appError('INVALID_REQUEST');
 
     const user = await requireUser(req);
-    const { conversationId, modelId, messages, temperature = 0.7, webSearch = false, attachments = [], requestId: rawRequestId, continueFromMessageId: rawContinueFromMessageId } = req.body || {};
+    const { conversationId, modelId, messages, temperature = 0.7, webSearch = false, attachments = [], requestId: rawRequestId, continueFromMessageId: rawContinueFromMessageId, agentMode = false, agentAction = 'plan' } = req.body || {};
     const continueFromMessageId = cleanText(rawContinueFromMessageId, 80);
     const requestId = normalizeRequestId(rawRequestId);
     reservationUserId = user.id; reservationRequestId = requestId;
@@ -324,7 +321,7 @@ export default async function handler(req, res) {
       if (error) throw appError('DATABASE_ERROR', {}, error);
     }
 
-    if (isFreeGemmaModel(model) && !continuationTarget && !webSearch && safeAttachments.length === 0) {
+    if (agentMode === true && !continuationTarget && !webSearch && safeAttachments.length === 0) {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -344,13 +341,13 @@ export default async function handler(req, res) {
             Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
             'Content-Type': 'application/json',
             'HTTP-Referer': `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers['x-forwarded-host'] || req.headers.host || 'localhost'}`,
-            'X-OpenRouter-Title': 'AiWay Agent Test',
+            'X-OpenRouter-Title': 'AiWay Multi-Agent Mode',
             'X-OpenRouter-Metadata': 'enabled'
           },
           body: JSON.stringify({
             model: model.id,
             messages: [
-              { role: 'system', content: `${formatSystemPrompt(model, language)}\n\nYou are the ${role} in a controlled multi-agent software workflow. Follow only your assigned role.` },
+              { role: 'system', content: `${formatSystemPrompt(model, language)}\n\nYou are the ${role} in a controlled multi-agent software workflow. Complete only your assigned stage and return a finished response for that stage.` },
               { role: 'user', content: `${instruction}\n\nCONTEXT:\n${cleanText(context, 60000)}` }
             ],
             temperature: agentTemperature,
@@ -364,118 +361,75 @@ export default async function handler(req, res) {
         if (payload?.error) throw openRouterError(Number(payload.error?.code || 502), payload, { kind: 'chat' });
         const content = payload?.choices?.[0]?.message?.content;
         if (!String(content || '').trim()) throw appError('EMPTY_RESPONSE');
-        return {
-          content: String(content).trim(),
-          usage: payload?.usage || {},
-          generationId: payload?.id || null,
-          routedModelId: payload?.model || model.id
-        };
+        return { content: String(content).trim(), usage: payload?.usage || {}, generationId: payload?.id || null, routedModelId: payload?.model || model.id };
       };
 
       let workflowUsage = {};
       let answer = '';
-      let generationIds = [];
+      let agentStep = cleanText(agentAction, 20).toLowerCase();
+      let generationId = null;
       const pendingPlan = extractAgentPlan(cleaned);
+      const assistantMessages = cleaned.filter(m => m.role === 'assistant' && typeof m.content === 'string');
+      const latestCodeOutput = [...assistantMessages].reverse().find(m => /AIWAY_AGENT_CODE/.test(m.content))?.content
+        ?.replace(/<!--\s*AIWAY_AGENT_CODE\s*-->/g, '').trim() || '';
+      const originalRequests = cleaned.filter(m => m.role === 'user').map(m => typeof m.content === 'string' ? m.content : '').join('\n\n');
 
-      if (!pendingPlan) {
-        emitStage('planning', 'وكيل التخطيط يجهز الخطة', 'Planning agent is preparing the plan');
+      if (!['plan', 'code', 'review'].includes(agentStep)) agentStep = 'plan';
+      if (agentStep === 'plan') {
+        emitStage('planning', 'عدة وكلاء يحللون الطلب ويجهزون الخطة', 'Multiple agents are analyzing the request and preparing the plan');
         const planner = await callAgent({
-          role: 'planning agent',
-          maxTokens: 1600,
+          role: 'software planning agent', maxTokens: 1800,
           instruction: language === 'ar'
-            ? 'حلّل طلب المستخدم كمهندس برمجيات. أنشئ خطة تنفيذ عملية ومختصرة فقط، تشمل الهدف، الملفات أو المكونات، خطوات التنفيذ، ومعايير المراجعة. لا تكتب أي كود الآن. لا تدّع تنفيذ شيء.'
-            : 'Analyze the user request as a software engineer. Produce only a concise, practical implementation plan covering the goal, files or components, implementation steps, and review criteria. Do not write code yet or claim anything was implemented.',
+            ? 'حلّل طلب المستخدم كمهندس برمجيات. أنشئ خطة تنفيذ عملية ومكتملة فقط تشمل الهدف، المكونات أو الملفات، خطوات التنفيذ، المخاطر، ومعايير القبول. لا تكتب كودًا الآن، ولا تدّع التنفيذ.'
+            : 'Analyze the request as a software engineer. Produce a complete practical implementation plan covering the goal, components or files, implementation steps, risks, and acceptance criteria. Do not write code or claim implementation.',
           context: latestTextValue
         });
-        workflowUsage = mergeUsage(workflowUsage, planner.usage);
-        generationIds.push(planner.generationId);
+        workflowUsage = mergeUsage(workflowUsage, planner.usage); generationId = planner.generationId;
         answer = language === 'ar'
-          ? `## خطة وكيل التخطيط\n\n${planner.content}\n\n## موافقة مطلوبة\n\nاكتب **موافق** لبدء وكيل البرمجة ثم وكيل مراجعة الكود، أو اكتب التعديلات المطلوبة على الخطة.\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`
-          : `## Planning agent\n\n${planner.content}\n\n## Approval required\n\nReply **Approved** to start the coding agent followed by the code-review agent, or describe changes to the plan.\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`;
-      } else {
-        emitStage('approval', 'وكيل الموافقة يتحقق من قرارك', 'Approval agent is checking your decision');
-        const approval = await callAgent({
-          role: 'approval gate agent',
-          maxTokens: 140,
-          temperature: 0,
-          instruction: `Decide whether the user's latest message explicitly approves executing the supplied software plan. Return JSON only: {"approved":true|false,"note":"brief reason"}. Requests to change, explain, delay, cancel, or ask questions are not approval.`,
-          context: `PLAN:\n${pendingPlan}\n\nLATEST USER MESSAGE:\n${latestTextValue}`
+          ? `## خطة وكيل التخطيط\n\n${planner.content}\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`
+          : `## Planning agent result\n\n${planner.content}\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`;
+      } else if (agentStep === 'code') {
+        if (!pendingPlan) throw appError('INVALID_CHAT_REQUEST');
+        emitStage('coding', 'وكيل البرمجة ينفذ الخطة ويكتب الملفات', 'Coding agent is implementing the plan and writing the files');
+        const coder = await callAgent({
+          role: 'senior coding agent', maxTokens: Math.min(7500, Math.max(2200, initialMaxTokens)), temperature: 0.15,
+          instruction: language === 'ar'
+            ? 'نفّذ الخطة المعتمدة كاملة. اكتب كودًا صالحًا للتشغيل وليس pseudo-code. ضع كل ملف كامل داخل كتلة file-FILENAME. لا تختصر الملفات ولا تدّع تشغيل اختبارات لم تُشغّل.'
+            : 'Implement the approved plan completely. Write runnable code, not pseudocode. Put every complete file in a file-FILENAME fenced block. Do not omit file contents or claim tests were run when they were not.',
+          context: `APPROVED PLAN:\n${pendingPlan}\n\nORIGINAL REQUESTS:\n${originalRequests}`
         });
-        workflowUsage = mergeUsage(workflowUsage, approval.usage);
-        generationIds.push(approval.generationId);
-        const decision = parseApprovalDecision(approval.content);
-
-        if (!decision.approved) {
-          answer = language === 'ar'
-            ? `لم يعتبر وكيل الموافقة الرسالة موافقة صريحة على التنفيذ${decision.note ? `: ${decision.note}` : '.'}\n\nاكتب **موافق** للتنفيذ، أو اذكر التعديل المطلوب على الخطة.\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(pendingPlan)} -->`
-            : `The approval agent did not treat that message as explicit approval${decision.note ? `: ${decision.note}` : '.'}\n\nReply **Approved** to execute, or describe the requested plan change.\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(pendingPlan)} -->`;
-        } else {
-          emitStage('coding', 'وكيل البرمجة يكتب الكود', 'Coding agent is writing the code');
-          const coder = await callAgent({
-            role: 'coding agent',
-            maxTokens: Math.min(6500, Math.max(1800, initialMaxTokens)),
-            temperature: 0.15,
-            instruction: language === 'ar'
-              ? 'نفّذ الخطة المعتمدة. اكتب كودًا كاملًا صالحًا للتشغيل، وليس pseudo-code. استخدم Markdown واضحًا، وضع كل ملف كامل داخل كتلة باسم file-FILENAME عند وجود أكثر من ملف. لا تقل إنك شغّلت اختبارات لم تشغّلها.'
-              : 'Implement the approved plan. Write complete runnable code, not pseudocode. Use clear Markdown and put each complete file in a file-FILENAME fenced block when there is more than one file. Never claim tests were run when they were not.',
-            context: `APPROVED PLAN:\n${pendingPlan}\n\nORIGINAL USER REQUEST:\n${cleaned.filter(m => m.role === 'user').map(m => typeof m.content === 'string' ? m.content : '').join('\n\n')}`
-          });
-          workflowUsage = mergeUsage(workflowUsage, coder.usage);
-          generationIds.push(coder.generationId);
-
-          emitStage('reviewing', 'وكيل المراجعة يفحص الكود ويصححه', 'Review agent is checking and correcting the code');
-          const reviewer = await callAgent({
-            role: 'senior code review agent',
-            maxTokens: Math.min(7000, Math.max(2000, initialMaxTokens)),
-            temperature: 0.1,
-            instruction: language === 'ar'
-              ? 'راجع تنفيذ وكيل البرمجة مقابل الخطة والطلب. أصلح أخطاء المنطق والأمان والصياغة والنواقص مباشرة. أعد النتيجة النهائية الكاملة الجاهزة للنسخ أو التنزيل، وليس قائمة ملاحظات فقط. اذكر باختصار ما راجعته، ثم اعرض الملفات الكاملة المصححة.'
-              : 'Review the coding agent output against the plan and request. Directly fix logic, security, syntax, and completeness problems. Return the complete final corrected result ready to copy or download, not merely review comments. Briefly state what was reviewed, then provide all corrected files in full.',
-            context: `PLAN:\n${pendingPlan}\n\nCODING AGENT OUTPUT:\n${coder.content}`
-          });
-          workflowUsage = mergeUsage(workflowUsage, reviewer.usage);
-          generationIds.push(reviewer.generationId);
-          answer = language === 'ar'
-            ? `## نتيجة وكيل المراجعة\n\n${reviewer.content}`
-            : `## Code-review agent result\n\n${reviewer.content}`;
-        }
+        workflowUsage = mergeUsage(workflowUsage, coder.usage); generationId = coder.generationId;
+        answer = language === 'ar'
+          ? `## نتيجة وكيل البرمجة\n\n${coder.content}\n\n<!-- AIWAY_AGENT_CODE -->`
+          : `## Coding agent result\n\n${coder.content}\n\n<!-- AIWAY_AGENT_CODE -->`;
+      } else {
+        if (!pendingPlan || !latestCodeOutput) throw appError('INVALID_CHAT_REQUEST');
+        emitStage('reviewing', 'فريق المراجعة يفحص الكود ويصحح الأخطاء', 'Review agents are inspecting and correcting the code');
+        const reviewer = await callAgent({
+          role: 'senior code review and security agent', maxTokens: Math.min(8000, Math.max(2400, initialMaxTokens)), temperature: 0.1,
+          instruction: language === 'ar'
+            ? 'راجع الكود مقابل الخطة والطلب. اكتشف وأصلح أخطاء المنطق والصياغة والأمان والنواقص مباشرة. أعد النسخة النهائية الكاملة الجاهزة للاستخدام، مع ملخص قصير للمراجعة ثم كل الملفات المصححة كاملة.'
+            : 'Review the code against the plan and request. Find and directly fix logic, syntax, security, and completeness issues. Return the full final usable version, with a short review summary followed by every corrected file in full.',
+          context: `PLAN:\n${pendingPlan}\n\nCODE TO REVIEW:\n${latestCodeOutput}`
+        });
+        workflowUsage = mergeUsage(workflowUsage, reviewer.usage); generationId = reviewer.generationId;
+        answer = language === 'ar' ? `## نتيجة وكيل المراجعة\n\n${reviewer.content}` : `## Review agent result\n\n${reviewer.content}`;
       }
 
       emitText(answer);
       const charge = chargeTokens(model.pricing, workflowUsage, false);
-      if (charge.chargedTokens > availableTokens) throw appError('INSUFFICIENT_TOKENS_FOR_REQUEST', {
-        availableTokens, requiredTokens: charge.chargedTokens, shortfall: charge.chargedTokens - availableTokens
-      });
+      if (charge.chargedTokens > availableTokens) throw appError('INSUFFICIENT_TOKENS_FOR_REQUEST', { availableTokens, requiredTokens: charge.chargedTokens, shortfall: charge.chargedTokens - availableTokens });
       const result = await supabase.from('messages').insert({
-        conversation_id: conversationId,
-        user_id: user.id,
-        role: 'assistant',
-        content: answer,
-        model_id: model.id,
-        token_usage: {
-          ...workflowUsage,
-          ...charge,
-          requestedModelId: modelId,
-          activeModelId: model.id,
-          routedModelId: model.id,
-          agentWorkflow: true,
-          agentCount: pendingPlan ? 3 : 1,
-          generationIds: generationIds.filter(Boolean)
-        }
+        conversation_id: conversationId, user_id: user.id, role: 'assistant', content: answer, model_id: model.id,
+        token_usage: { ...workflowUsage, ...charge, requestedModelId: modelId, activeModelId: model.id, routedModelId: model.id, agentWorkflow: true, agentStep, generationIds: generationId ? [generationId] : [] }
       }).select('id').single();
       if (result.error || !result.data) throw appError('DATABASE_ERROR', {}, result.error);
-      const remainingTokens = await finalizeAiTokens(supabase, user.id, requestId, charge.chargedTokens, {
-        messageId: result.data.id, modelId: model.id, generationId: generationIds.filter(Boolean).at(-1) || null
-      });
+      const remainingTokens = await finalizeAiTokens(supabase, user.id, requestId, charge.chargedTokens, { messageId: result.data.id, modelId: model.id, generationId });
       reservationActive = false;
-      await supabase.from('conversations').update({ model_id: model.id, updated_at: new Date().toISOString() })
-        .eq('id', conversationId).eq('user_id', user.id);
-      res.write(`data: ${JSON.stringify({
-        type: 'done', usage: workflowUsage, chargedTokens: charge.chargedTokens, remainingTokens,
-        lowBalance: isLowBalance(remainingTokens, charge.chargedTokens), requestedModelId: modelId,
-        routedModelId: model.id, activeModelId: model.id, messageId: result.data.id,
-        agentWorkflow: true, agentCount: pendingPlan ? 3 : 1
-      })}\n\n`);
+      await supabase.from('conversations').update({ model_id: model.id, updated_at: new Date().toISOString() }).eq('id', conversationId).eq('user_id', user.id);
+      res.write(`data: ${JSON.stringify({ type: 'done', usage: workflowUsage, chargedTokens: charge.chargedTokens, remainingTokens,
+        lowBalance: isLowBalance(remainingTokens, charge.chargedTokens), requestedModelId: modelId, routedModelId: model.id,
+        activeModelId: model.id, messageId: result.data.id, agentWorkflow: true, agentStep })}\n\n`);
       return res.end();
     }
 
