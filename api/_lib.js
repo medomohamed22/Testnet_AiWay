@@ -223,33 +223,40 @@ export async function requireUser(req) {
   const token = headerToken || bodyToken || cookieToken;
   if (!token) throw appError('UNAUTHORIZED');
   if (!headerToken && !bodyToken && cookieToken) enforceSameOrigin(req);
+  let payload;
   try {
-    const { payload } = await jwtVerify(token, new TextEncoder().encode(appJwtSecret), {
+    ({ payload } = await jwtVerify(token, new TextEncoder().encode(appJwtSecret), {
       algorithms: ['HS256'],
       issuer: JWT_ISSUER,
       audience: APP_TOKEN_AUDIENCE
-    });
-    if (!payload.sub) throw appError('UNAUTHORIZED');
-
-    // Never trust authorization-relevant claims from a stale token. Confirm that the
-    // account still exists and read the current role from the database on every request.
-    const supabase = db();
-    const { data: currentUser, error } = await supabase
-      .from('users')
-      .select('id,username,pi_uid,role')
-      .eq('id', payload.sub)
-      .maybeSingle();
-    if (error || !currentUser) throw appError('UNAUTHORIZED');
-
-    // Paid balances are monthly. Expire any unused balance before every
-    // authenticated API action so an expired package cannot be consumed.
-    const { error: expiryError } = await supabase.rpc('expire_user_tokens', { p_user_id: currentUser.id });
-    if (expiryError) throw appError('DATABASE_ERROR', {}, expiryError);
-    return currentUser;
+    }));
   } catch (error) {
-    if (error?.code === 'UNAUTHORIZED') throw error;
     throw appError('UNAUTHORIZED', {}, error);
   }
+  if (!payload?.sub) throw appError('UNAUTHORIZED');
+
+  // Confirm the account still exists. A real database/configuration failure must not
+  // be disguised as UNAUTHORIZED, otherwise a valid Pi login appears to have failed.
+  const supabase = db();
+  const { data: currentUser, error: userError } = await supabase
+    .from('users')
+    .select('id,username,pi_uid,role')
+    .eq('id', payload.sub)
+    .maybeSingle();
+  if (userError) throw appError('DATABASE_ERROR', {}, userError);
+  if (!currentUser) throw appError('UNAUTHORIZED');
+
+  // Token-expiry maintenance is not authentication. Older/incompletely migrated
+  // databases may not yet contain this RPC (or its grant), so do not reject a valid
+  // signed-in user because this optional maintenance step failed.
+  const { error: expiryError } = await supabase.rpc('expire_user_tokens', { p_user_id: currentUser.id });
+  if (expiryError) {
+    console.warn('[TOKEN_EXPIRY_MAINTENANCE_SKIPPED]', {
+      code: expiryError.code || '',
+      message: expiryError.message || ''
+    });
+  }
+  return currentUser;
 }
 
 export async function requireAdmin(user) {
