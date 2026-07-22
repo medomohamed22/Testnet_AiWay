@@ -217,9 +217,12 @@ export async function requireUser(req) {
   const bodyToken = req.method === 'POST' && String(req.body?.action || '').startsWith('download-')
     ? String(req.body?.authToken || '')
     : '';
-  const token = cookieToken || headerToken || bodyToken;
-  if (cookieToken) enforceSameOrigin(req);
+  // Prefer an explicit Bearer token over the browser cookie. Pi Browser can
+  // retain a stale/blocked cookie even after a successful SDK sign-in; choosing
+  // the cookie first would reject the fresh token returned by /api/pi-login.
+  const token = headerToken || bodyToken || cookieToken;
   if (!token) throw appError('UNAUTHORIZED');
+  if (!headerToken && !bodyToken && cookieToken) enforceSameOrigin(req);
   try {
     const { payload } = await jwtVerify(token, new TextEncoder().encode(appJwtSecret), {
       algorithms: ['HS256'],
