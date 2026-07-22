@@ -183,25 +183,15 @@ export async function requireUser(req) {
 
     // Never trust authorization-relevant claims from a stale token. Confirm that the
     // account still exists and read the current role from the database on every request.
-    const client = db();
-    const { data: currentUser, error } = await client
+    const { data: currentUser, error } = await db()
       .from('users')
       .select('id,username,pi_uid,role')
       .eq('id', payload.sub)
       .maybeSingle();
     if (error || !currentUser) throw appError('UNAUTHORIZED');
-
-    const { data: banRow, error: banError } = await client
-      .from('users')
-      .select('is_banned')
-      .eq('id', payload.sub)
-      .maybeSingle();
-    if (banError && banError.code !== '42703') throw appError('UNAUTHORIZED');
-    currentUser.is_banned = Boolean(banRow?.is_banned);
-    if (currentUser.is_banned) throw appError('ACCOUNT_BANNED');
     return currentUser;
   } catch (error) {
-    if (error?.code === 'UNAUTHORIZED' || error?.code === 'ACCOUNT_BANNED') throw error;
+    if (error?.code === 'UNAUTHORIZED') throw error;
     throw appError('UNAUTHORIZED', {}, error);
   }
 }
@@ -550,51 +540,6 @@ export const PACKAGES = {
   pro: { usd: 10, tokens: tokensForUsd(10) }
 };
 
-const DEFAULT_ADMIN_CONFIG = {
-  packages: PACKAGES,
-  categories: [
-    { id: 'recommended', ar: 'مختارة لك', en: 'Recommended', order: 1 },
-    { id: 'free', ar: 'مجانية', en: 'Free', order: 2 },
-    { id: 'cheap', ar: 'الأرخص', en: 'Lowest cost', order: 3 },
-    { id: 'premium', ar: 'الأقوى', en: 'Premium', order: 4 },
-    { id: 'images', ar: 'إنشاء الصور', en: 'Image generation', order: 5 }
-  ],
-  models: {}
-};
-let adminConfigCache = { at: 0, value: DEFAULT_ADMIN_CONFIG };
-export async function getAdminConfig({ fresh = false } = {}) {
-  if (!fresh && Date.now() - adminConfigCache.at < 30000) return adminConfigCache.value;
-  try {
-    const { data, error } = await db().from('app_settings').select('value').eq('key', 'admin_catalog').maybeSingle();
-    if (error) throw error;
-    const raw = data?.value && typeof data.value === 'object' ? data.value : {};
-    const value = {
-      packages: { ...PACKAGES, ...(raw.packages || {}) },
-      categories: Array.isArray(raw.categories) && raw.categories.length ? raw.categories : DEFAULT_ADMIN_CONFIG.categories,
-      models: raw.models && typeof raw.models === 'object' ? raw.models : {}
-    };
-    adminConfigCache = { at: Date.now(), value };
-    return value;
-  } catch (error) {
-    console.warn('Using default admin catalog settings:', error?.message || error);
-    return adminConfigCache.value;
-  }
-}
-export async function saveAdminConfig(value) {
-  const normalized = {
-    packages: { ...PACKAGES, ...(value?.packages || {}) },
-    categories: Array.isArray(value?.categories) ? value.categories : DEFAULT_ADMIN_CONFIG.categories,
-    models: value?.models && typeof value.models === 'object' ? value.models : {}
-  };
-  const { error } = await db().from('app_settings').upsert({ key: 'admin_catalog', value: normalized, updated_at: new Date().toISOString() }, { onConflict: 'key' });
-  if (error) throw appError('DATABASE_ERROR', {}, error);
-  adminConfigCache = { at: Date.now(), value: normalized };
-  return normalized;
-}
-export async function getConfiguredPackages() {
-  return (await getAdminConfig()).packages;
-}
-
 const FAMILY_CONFIG = [
   { key: 'chatgpt', label: 'ChatGPT', prefix: 'openai/', tag: 'OpenAI' },
   { key: 'gemini', label: 'Gemini', prefix: 'google/', tag: 'Google' },
@@ -660,7 +605,7 @@ function normalizeModel(model, family) {
   };
 }
 
-export async function getOpenRouterCatalog() {
+export async function getAvailableModels() {
   if (Date.now() - catalogCache.at < 60 * 60 * 1000 && catalogCache.models.length >= 20) return catalogCache.models;
   try {
     const response = await fetchWithTimeout('https://openrouter.ai/api/v1/models', {
@@ -668,33 +613,37 @@ export async function getOpenRouterCatalog() {
     }, 15000);
     if (!response.ok) throw new Error(`OpenRouter models ${response.status}`);
     const payload = await response.json();
-    const all = (payload.data || []).filter(isTextChatModel).map(model => {
-      const provider = String(model.id || '').split('/')[0] || 'other';
-      const known = FAMILY_CONFIG.find(f => String(model.id || '').startsWith(f.prefix));
-      return normalizeModel(model, known || { key: provider, label: provider, tag: provider });
-    }).sort((a,b) => {
-      const ac=(Number(a.pricing?.prompt)||0)+(Number(a.pricing?.completion)||0);
-      const bc=(Number(b.pricing?.prompt)||0)+(Number(b.pricing?.completion)||0);
-      return ac-bc || String(a.name).localeCompare(String(b.name));
-    });
-    if (!all.length) throw new Error('Empty OpenRouter catalog');
-    catalogCache = { at: Date.now(), models: all };
-    return all;
+    const selected = [];
+    for (const family of FAMILY_CONFIG) {
+      const familyModels = (payload.data || [])
+        .filter(model => {
+          if (!String(model.id || '').startsWith(family.prefix) || !isTextChatModel(model)) return false;
+          const promptPrice = Number(model.pricing?.prompt || 0);
+          const completionPrice = Number(model.pricing?.completion || 0);
+          const isZeroCost = promptPrice === 0 && completionPrice === 0;
+          return model.id === TRIAL_MODEL_FALLBACK || !isZeroCost;
+        })
+        .map(model => normalizeModel(model, family))
+        .sort((a, b) => b.created - a.created || a.name.localeCompare(b.name))
+        .slice(0, 5);
+      selected.push(...familyModels);
+    }
+    if (selected.length < FAMILY_CONFIG.length * 5) throw new Error('Incomplete OpenRouter catalog');
+    const trialFromPayload = (payload.data || []).find(model => model.id === TRIAL_MODEL_FALLBACK);
+    const trialModel = trialFromPayload
+      ? normalizeModel(trialFromPayload, FAMILY_CONFIG.find(family => family.key === 'gemini'))
+      : FALLBACK_MODELS.find(model => model.id === TRIAL_MODEL_FALLBACK);
+    if (trialModel && !selected.some(model => model.id === TRIAL_MODEL_FALLBACK)) {
+      const googleIndex = selected.findIndex(model => model.family === 'gemini');
+      selected.splice(googleIndex >= 0 ? googleIndex : 0, 0, trialModel);
+    }
+    // Only the official Gemma trial model is exposed as free.
+    catalogCache = { at: Date.now(), models: selected };
+    return selected;
   } catch (error) {
     console.warn('Using fallback model catalog:', error.message);
     return catalogCache.models;
   }
-}
-
-export async function getAvailableModels() {
-  const [catalog, config] = await Promise.all([getOpenRouterCatalog(), getAdminConfig()]);
-  const configuredIds = Object.keys(config.models || {});
-  if (!configuredIds.length) return catalog.filter(m => FAMILY_CONFIG.some(f => m.id.startsWith(f.prefix))).slice(0, 30);
-  return catalog.filter(model => config.models?.[model.id]?.visible).map(model => {
-    const setting = config.models[model.id] || {};
-    const category = config.categories.find(c => c.id === setting.categoryId);
-    return { ...model, categoryId: setting.categoryId || 'recommended', categoryLabel: category?.ar || 'مختارة لك', displayOrder: Number(setting.order || 9999) };
-  }).sort((a,b)=>a.displayOrder-b.displayOrder || a.name.localeCompare(b.name));
 }
 
 export function isFreeModel(model) {
@@ -907,7 +856,7 @@ export async function getPiUsd() {
 }
 
 export async function packageQuote(id) {
-  const pack = (await getConfiguredPackages())[id];
+  const pack = PACKAGES[id];
   if (!pack) return null;
   const piUsd = await getPiUsd();
   return { ...pack, piUsd, amountPi: Number((pack.usd / piUsd).toFixed(7)), quotedAt: new Date().toISOString() };
