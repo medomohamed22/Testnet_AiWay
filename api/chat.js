@@ -164,6 +164,50 @@ function extractAgentPlan(messages) {
   return '';
 }
 
+const AGENT_ROUTE_MARKER = 'AIWAY_AGENT_ROUTE';
+const AGENT_EXECUTION_MARKER = 'AIWAY_AGENT_EXECUTION';
+const AGENT_REVIEW_MARKER = 'AIWAY_AGENT_REVIEW';
+const AGENT_REPAIR_MARKER = 'AIWAY_AGENT_REPAIR';
+const MAX_AGENT_REPAIRS = 2;
+
+function encodeAgentJson(value) {
+  return Buffer.from(JSON.stringify(value || {}), 'utf8').toString('base64url');
+}
+function decodeAgentJson(value) {
+  try { return JSON.parse(Buffer.from(String(value || ''), 'base64url').toString('utf8')); } catch { return {}; }
+}
+function extractLatestMarker(messages, marker) {
+  const re = new RegExp(`<!--\\s*${marker}:([A-Za-z0-9_-]+)\\s*-->`);
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const content = messages[index]?.role === 'assistant' ? String(messages[index]?.content || '') : '';
+    const match = content.match(re);
+    if (match) return decodeAgentJson(match[1]);
+  }
+  return {};
+}
+function stripAgentMarkers(value) {
+  return String(value || '').replace(/<!--\s*AIWAY_AGENT_[A-Z_]+(?::[A-Za-z0-9_-]+)?\s*-->/g, '').trim();
+}
+function latestAgentArtifact(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const content = String(messages[index]?.content || '');
+    if (messages[index]?.role === 'assistant' && /AIWAY_AGENT_(?:EXECUTION|REPAIR)/.test(content)) return stripAgentMarkers(content);
+  }
+  return '';
+}
+function currentRepairCount(messages) {
+  const marker = extractLatestMarker(messages, AGENT_REPAIR_MARKER);
+  return Math.max(0, Math.min(MAX_AGENT_REPAIRS, Number(marker.count || 0)));
+}
+function parseJsonObject(text, fallback = {}) {
+  const raw = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  try { return JSON.parse(raw); } catch {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return fallback;
+    try { return JSON.parse(match[0]); } catch { return fallback; }
+  }
+}
+
 function mergeUsage(target, usage) {
   const result = { ...target };
   for (const key of ['prompt_tokens', 'completion_tokens', 'total_tokens', 'input_tokens', 'output_tokens']) {
@@ -334,7 +378,7 @@ export default async function handler(req, res) {
         const chunks = String(text || '').match(/[\s\S]{1,700}/g) || [];
         for (const chunk of chunks) res.write(`data: ${JSON.stringify({ type: 'delta', text: chunk })}\n\n`);
       };
-      const callAgent = async ({ role, instruction, context, maxTokens = 1800, temperature: agentTemperature = 0.2 }) => {
+      const callAgent = async ({ role, instruction, context, maxTokens = 1800, temperature: agentTemperature = 0.2, json = false }) => {
         const response = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
           method: 'POST',
           headers: {
@@ -347,8 +391,8 @@ export default async function handler(req, res) {
           body: JSON.stringify({
             model: model.id,
             messages: [
-              { role: 'system', content: `${formatSystemPrompt(model, language)}\n\nYou are the ${role} in a controlled multi-agent workflow. The user's request may be about programming, study, training, planning, writing, research, analysis, or any other legitimate task. Complete only your assigned stage and return a polished, finished response for that stage.` },
-              { role: 'user', content: `${instruction}\n\nCONTEXT:\n${cleanText(context, 60000)}` }
+              { role: 'system', content: `${formatSystemPrompt(model, language)}\n\nYou are the ${role} in a controlled multi-agent workflow. Complete only your assigned stage. Never claim that tools, tests, browsing, deployment, or external actions ran unless their results are present in the supplied context.${json ? ' Return only valid JSON with no markdown.' : ''}` },
+              { role: 'user', content: `${instruction}\n\nCONTEXT:\n${cleanText(context, 70000)}` }
             ],
             temperature: agentTemperature,
             max_tokens: Math.max(64, Math.floor(maxTokens)),
@@ -361,7 +405,7 @@ export default async function handler(req, res) {
         if (payload?.error) throw openRouterError(Number(payload.error?.code || 502), payload, { kind: 'chat' });
         const content = payload?.choices?.[0]?.message?.content;
         if (!String(content || '').trim()) throw appError('EMPTY_RESPONSE');
-        return { content: String(content).trim(), usage: payload?.usage || {}, generationId: payload?.id || null, routedModelId: payload?.model || model.id };
+        return { content: String(content).trim(), usage: payload?.usage || {}, generationId: payload?.id || null };
       };
 
       let workflowUsage = {};
@@ -369,51 +413,86 @@ export default async function handler(req, res) {
       let agentStep = cleanText(agentAction, 20).toLowerCase();
       let generationId = null;
       const pendingPlan = extractAgentPlan(cleaned);
-      const assistantMessages = cleaned.filter(m => m.role === 'assistant' && typeof m.content === 'string');
-      const latestExecutionOutput = [...assistantMessages].reverse().find(m => /AIWAY_AGENT_EXECUTION/.test(m.content))?.content
-        ?.replace(/<!--\s*AIWAY_AGENT_EXECUTION\s*-->/g, '').trim() || '';
-      const originalRequests = cleaned.filter(m => m.role === 'user').map(m => typeof m.content === 'string' ? m.content : '').join('\n\n');
+      const routeInfo = extractLatestMarker(cleaned, AGENT_ROUTE_MARKER);
+      const reviewInfo = extractLatestMarker(cleaned, AGENT_REVIEW_MARKER);
+      const repairCount = currentRepairCount(cleaned);
+      const artifact = latestAgentArtifact(cleaned);
+      const originalRequests = cleaned.filter(m => m.role === 'user' && !/^\s*(?:موافق|approved|راجع|review|أصلح|repair)/i.test(String(m.content || '')))
+        .map(m => typeof m.content === 'string' ? m.content : '').join('\n\n');
 
-      if (!['plan', 'code', 'review'].includes(agentStep)) agentStep = 'plan';
+      if (!['plan', 'code', 'review', 'repair'].includes(agentStep)) agentStep = 'plan';
       if (agentStep === 'plan') {
-        emitStage('planning', 'عدة وكلاء يحللون الطلب ويجهزون الخطة', 'Multiple agents are analyzing the request and preparing the plan');
-        const planner = await callAgent({
-          role: 'planning and strategy agent', maxTokens: 2200,
+        emitStage('routing', 'وكيل التوجيه يحدد أفضل مسار للمهمة', 'The routing agent is selecting the best workflow');
+        const router = await callAgent({
+          role: 'workflow routing agent', json: true, maxTokens: 500, temperature: 0,
           instruction: language === 'ar'
-            ? 'حلّل طلب المستخدم مهما كان نوعه. أنشئ خطة عملية ومكتملة تشمل الهدف، المدخلات المطلوبة، خطوات التنفيذ، المخرجات المتوقعة، المخاطر أو النواقص، ومعايير النجاح. لا تنفذ المهمة الآن ولا تدّع التنفيذ.'
-            : 'Analyze the user request regardless of its type. Produce a complete practical plan covering the goal, required inputs, execution steps, expected outputs, risks or gaps, and success criteria. Do not execute the task or claim completion yet.',
+            ? 'صنّف الطلب وأعد JSON فقط بالمفاتيح: taskType, complexity (simple|medium|complex), needsResearch, needsTools, keyRisks (array), executionFocus. لا تنفذ الطلب.'
+            : 'Classify the request and return JSON only with: taskType, complexity (simple|medium|complex), needsResearch, needsTools, keyRisks (array), executionFocus. Do not execute it.',
           context: latestTextValue
+        });
+        workflowUsage = mergeUsage(workflowUsage, router.usage);
+        const route = parseJsonObject(router.content, { taskType: 'general', complexity: 'medium', needsResearch: false, needsTools: false, keyRisks: [], executionFocus: '' });
+
+        emitStage('planning', 'وكيل التخطيط يبني خطة قابلة للتنفيذ', 'The planning agent is building an actionable plan');
+        const planner = await callAgent({
+          role: 'planning and strategy agent', maxTokens: 2400,
+          instruction: language === 'ar'
+            ? 'أنشئ خطة عملية مكتملة ومناسبة لتصنيف المهمة. اذكر الهدف، الافتراضات، المدخلات، الخطوات، المخرجات، معايير النجاح، وما يحتاج أداة أو مصدرًا خارجيًا. لا تنفذ المهمة الآن.'
+            : 'Create a complete actionable plan tailored to the task classification. Include objective, assumptions, inputs, steps, deliverables, success criteria, and anything requiring an external tool or source. Do not execute yet.',
+          context: `ROUTE:\n${JSON.stringify(route)}\n\nREQUEST:\n${latestTextValue}`
         });
         workflowUsage = mergeUsage(workflowUsage, planner.usage); generationId = planner.generationId;
         answer = language === 'ar'
-          ? `## خطة وكيل التخطيط\n\n${planner.content}\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`
-          : `## Planning agent result\n\n${planner.content}\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`;
+          ? `## خطة وكيل التخطيط\n\n${planner.content}\n\n<!-- ${AGENT_ROUTE_MARKER}:${encodeAgentJson(route)} -->\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`
+          : `## Planning agent result\n\n${planner.content}\n\n<!-- ${AGENT_ROUTE_MARKER}:${encodeAgentJson(route)} -->\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`;
       } else if (agentStep === 'code') {
         if (!pendingPlan) throw appError('INVALID_CHAT_REQUEST');
-        emitStage('executing', 'وكيل التنفيذ يطبق الخطة ويجهز النتيجة', 'The execution agent is applying the plan and preparing the result');
-        const coder = await callAgent({
+        emitStage('executing', 'وكيل التنفيذ يطبق الخطة', 'The execution agent is applying the plan');
+        const executor = await callAgent({
           role: 'senior execution agent', maxTokens: Math.min(7500, Math.max(2200, initialMaxTokens)), temperature: 0.18,
           instruction: language === 'ar'
-            ? 'نفّذ الخطة المعتمدة كاملة وفق نوع طلب المستخدم. إذا كان الطلب برمجيًا فاكتب كودًا صالحًا للتشغيل وضع كل ملف كامل داخل كتلة file-FILENAME. وإذا كان دراسة أو تدريبًا أو كتابة أو تحليلًا فأنتج المحتوى النهائي الكامل القابل للاستخدام. لا تختصر النتيجة ولا تدّع تنفيذ اختبارات أو إجراءات لم تحدث.'
-            : 'Execute the approved plan completely according to the request type. For programming tasks, write runnable code and put every complete file in a file-FILENAME fenced block. For study, training, writing, analysis, or other tasks, produce the complete final usable deliverable. Do not omit essential content or claim tests or actions that were not actually performed.',
-          context: `APPROVED PLAN:\n${pendingPlan}\n\nORIGINAL REQUESTS:\n${originalRequests}`
+            ? 'نفّذ الخطة المعتمدة كاملة. للبرمجة: أعد كودًا صالحًا للتشغيل، وكل ملف كامل داخل كتلة file-FILENAME. لغير البرمجة: أعد المخرج النهائي الكامل القابل للاستخدام. وضّح بصدق أي جزء يحتاج أداة أو تحققًا خارجيًا.'
+            : 'Execute the approved plan fully. For programming, return runnable code with every complete file in a file-FILENAME fenced block. For other tasks, return the complete usable deliverable. Clearly identify anything requiring an external tool or verification.',
+          context: `ROUTE:\n${JSON.stringify(routeInfo)}\n\nAPPROVED PLAN:\n${pendingPlan}\n\nORIGINAL REQUEST:\n${originalRequests}`
         });
-        workflowUsage = mergeUsage(workflowUsage, coder.usage); generationId = coder.generationId;
+        workflowUsage = mergeUsage(workflowUsage, executor.usage); generationId = executor.generationId;
         answer = language === 'ar'
-          ? `## نتيجة وكيل التنفيذ\n\n${coder.content}\n\n<!-- AIWAY_AGENT_EXECUTION -->`
-          : `## Execution agent result\n\n${coder.content}\n\n<!-- AIWAY_AGENT_EXECUTION -->`;
-      } else {
-        if (!pendingPlan || !latestExecutionOutput) throw appError('INVALID_CHAT_REQUEST');
-        emitStage('reviewing', 'وكيل المراجعة يفحص النتيجة ويصحح أي مشكلة', 'The review agent is checking the result and correcting any issue');
+          ? `## نتيجة وكيل التنفيذ\n\n${executor.content}\n\n<!-- ${AGENT_EXECUTION_MARKER} -->`
+          : `## Execution agent result\n\n${executor.content}\n\n<!-- ${AGENT_EXECUTION_MARKER} -->`;
+      } else if (agentStep === 'review') {
+        if (!pendingPlan || !artifact) throw appError('INVALID_CHAT_REQUEST');
+        emitStage('reviewing', 'وكيل المراجعة يقارن النتيجة بالخطة', 'The review agent is comparing the result with the plan');
         const reviewer = await callAgent({
-          role: 'senior quality review and correction agent', maxTokens: Math.min(8000, Math.max(2400, initialMaxTokens)), temperature: 0.1,
+          role: 'independent quality reviewer', json: true, maxTokens: 2200, temperature: 0,
           instruction: language === 'ar'
-            ? 'راجع نتيجة التنفيذ مقابل الخطة وطلب المستخدم. اكتشف أي خطأ أو نقص أو تناقض أو مشكلة جودة وصححه مباشرة. أعد النسخة النهائية الكاملة الجاهزة للاستخدام، مع ملخص قصير لما تم إصلاحه. إذا كانت النتيجة كودًا فأعد كل الملفات المصححة كاملة.'
-            : 'Review the execution result against the plan and user request. Find and directly fix any error, omission, inconsistency, or quality issue. Return the complete final usable version with a short summary of corrections. If the result is code, return every corrected file in full.',
-          context: `PLAN:\n${pendingPlan}\n\nRESULT TO REVIEW:\n${latestExecutionOutput}`
+            ? 'راجع النتيجة دون إعادة كتابتها. أعد JSON فقط: verdict (pass|needs_revision), score من 0 إلى 100، summary، issues كمصفوفة من severity/location/problem/fix، وsuccessCriteriaMet كمصفوفة. اعتبر needs_revision فقط عند وجود مشكلة مؤثرة فعلًا.'
+            : 'Review without rewriting the result. Return JSON only: verdict (pass|needs_revision), score 0-100, summary, issues array with severity/location/problem/fix, and successCriteriaMet array. Use needs_revision only for material issues.',
+          context: `PLAN:\n${pendingPlan}\n\nRESULT:\n${artifact}\n\nREPAIRS ALREADY USED: ${repairCount}/${MAX_AGENT_REPAIRS}`
         });
         workflowUsage = mergeUsage(workflowUsage, reviewer.usage); generationId = reviewer.generationId;
-        answer = language === 'ar' ? `## نتيجة وكيل المراجعة\n\n${reviewer.content}` : `## Review agent result\n\n${reviewer.content}`;
+        const report = parseJsonObject(reviewer.content, { verdict: 'needs_revision', score: 0, summary: reviewer.content, issues: [], successCriteriaMet: [] });
+        const needsRevision = report.verdict === 'needs_revision' && repairCount < MAX_AGENT_REPAIRS;
+        const issueLines = Array.isArray(report.issues) && report.issues.length
+          ? report.issues.map((issue, i) => `${i + 1}. **${issue.severity || 'issue'}** — ${issue.location || ''}: ${issue.problem || ''}\n   - ${issue.fix || ''}`).join('\n')
+          : (language === 'ar' ? 'لا توجد مشكلات مؤثرة.' : 'No material issues found.');
+        answer = language === 'ar'
+          ? `## تقرير وكيل المراجعة\n\n**النتيجة:** ${Number(report.score || 0)}/100\n\n**الحكم:** ${report.verdict === 'pass' ? 'جاهز' : 'يحتاج تعديل'}\n\n${report.summary || ''}\n\n### الملاحظات\n${issueLines}\n\n${report.verdict === 'needs_revision' && repairCount >= MAX_AGENT_REPAIRS ? '**تم الوصول إلى الحد الأقصى للإصلاحات (2).**' : ''}\n\n<!-- ${AGENT_REVIEW_MARKER}:${encodeAgentJson({ ...report, needsRevision, repairCount })} -->`
+          : `## Review agent report\n\n**Score:** ${Number(report.score || 0)}/100\n\n**Verdict:** ${report.verdict === 'pass' ? 'Ready' : 'Needs revision'}\n\n${report.summary || ''}\n\n### Issues\n${issueLines}\n\n${report.verdict === 'needs_revision' && repairCount >= MAX_AGENT_REPAIRS ? '**Maximum repair limit reached (2).**' : ''}\n\n<!-- ${AGENT_REVIEW_MARKER}:${encodeAgentJson({ ...report, needsRevision, repairCount })} -->`;
+      } else {
+        if (!pendingPlan || !artifact || reviewInfo.needsRevision !== true || repairCount >= MAX_AGENT_REPAIRS) throw appError('INVALID_CHAT_REQUEST');
+        const nextRepair = repairCount + 1;
+        emitStage('repairing', `وكيل الإصلاح ينفذ المحاولة ${nextRepair} من ${MAX_AGENT_REPAIRS}`, `The repair agent is applying fix ${nextRepair} of ${MAX_AGENT_REPAIRS}`);
+        const repairer = await callAgent({
+          role: 'senior repair agent', maxTokens: Math.min(8000, Math.max(2400, initialMaxTokens)), temperature: 0.1,
+          instruction: language === 'ar'
+            ? 'أصلح فقط المشكلات المذكورة في تقرير المراجعة مع الحفاظ على الأجزاء الصحيحة. أعد النسخة النهائية الكاملة، وليس patch فقط. إذا كانت كودًا فأعد كل الملفات كاملة بصيغة file-FILENAME.'
+            : 'Fix only the issues identified in the review while preserving correct parts. Return the complete final deliverable, not just a patch. For code, return every complete file using file-FILENAME blocks.',
+          context: `PLAN:\n${pendingPlan}\n\nCURRENT RESULT:\n${artifact}\n\nREVIEW REPORT:\n${JSON.stringify(reviewInfo)}`
+        });
+        workflowUsage = mergeUsage(workflowUsage, repairer.usage); generationId = repairer.generationId;
+        answer = language === 'ar'
+          ? `## نتيجة وكيل الإصلاح — ${nextRepair}/${MAX_AGENT_REPAIRS}\n\n${repairer.content}\n\n<!-- ${AGENT_REPAIR_MARKER}:${encodeAgentJson({ count: nextRepair })} -->`
+          : `## Repair agent result — ${nextRepair}/${MAX_AGENT_REPAIRS}\n\n${repairer.content}\n\n<!-- ${AGENT_REPAIR_MARKER}:${encodeAgentJson({ count: nextRepair })} -->`;
       }
 
       emitText(answer);
@@ -421,7 +500,7 @@ export default async function handler(req, res) {
       if (charge.chargedTokens > availableTokens) throw appError('INSUFFICIENT_TOKENS_FOR_REQUEST', { availableTokens, requiredTokens: charge.chargedTokens, shortfall: charge.chargedTokens - availableTokens });
       const result = await supabase.from('messages').insert({
         conversation_id: conversationId, user_id: user.id, role: 'assistant', content: answer, model_id: model.id,
-        token_usage: { ...workflowUsage, ...charge, requestedModelId: modelId, activeModelId: model.id, routedModelId: model.id, agentWorkflow: true, agentStep, generationIds: generationId ? [generationId] : [] }
+        token_usage: { ...workflowUsage, ...charge, requestedModelId: modelId, activeModelId: model.id, routedModelId: model.id, agentWorkflow: true, agentStep, repairCount, generationIds: generationId ? [generationId] : [] }
       }).select('id').single();
       if (result.error || !result.data) throw appError('DATABASE_ERROR', {}, result.error);
       const remainingTokens = await finalizeAiTokens(supabase, user.id, requestId, charge.chargedTokens, { messageId: result.data.id, modelId: model.id, generationId });
@@ -429,7 +508,7 @@ export default async function handler(req, res) {
       await supabase.from('conversations').update({ model_id: model.id, updated_at: new Date().toISOString() }).eq('id', conversationId).eq('user_id', user.id);
       res.write(`data: ${JSON.stringify({ type: 'done', usage: workflowUsage, chargedTokens: charge.chargedTokens, remainingTokens,
         lowBalance: isLowBalance(remainingTokens, charge.chargedTokens), requestedModelId: modelId, routedModelId: model.id,
-        activeModelId: model.id, messageId: result.data.id, agentWorkflow: true, agentStep })}\n\n`);
+        activeModelId: model.id, messageId: result.data.id, agentWorkflow: true, agentStep, repairCount })}\n\n`);
       return res.end();
     }
 
