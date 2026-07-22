@@ -146,6 +146,46 @@ async function readProviderFailure(response) {
   try { return JSON.parse(text); } catch { return text; }
 }
 
+
+const AGENT_PLAN_MARKER = 'AIWAY_AGENT_PLAN';
+const isFreeGemmaModel = model => Boolean(
+  model && isFreeModel(model) && /gemma/i.test(`${model.id || ''} ${model.name || ''} ${model.shortName || ''}`)
+);
+
+function encodeAgentPlan(plan) {
+  return Buffer.from(String(plan || ''), 'utf8').toString('base64url');
+}
+
+function extractAgentPlan(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'assistant' || typeof message.content !== 'string') continue;
+    const match = message.content.match(/<!--\s*AIWAY_AGENT_PLAN:([A-Za-z0-9_-]+)\s*-->/);
+    if (!match) continue;
+    try { return Buffer.from(match[1], 'base64url').toString('utf8'); } catch { return ''; }
+  }
+  return '';
+}
+
+function mergeUsage(target, usage) {
+  const result = { ...target };
+  for (const key of ['prompt_tokens', 'completion_tokens', 'total_tokens', 'input_tokens', 'output_tokens']) {
+    result[key] = Math.max(0, Number(result[key] || 0)) + Math.max(0, Number(usage?.[key] || 0));
+  }
+  result.cost = Math.max(0, Number(result.cost || 0)) + Math.max(0, Number(usage?.cost || 0));
+  return result;
+}
+
+function parseApprovalDecision(text) {
+  const raw = String(text || '').trim();
+  try {
+    const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
+    return { approved: parsed.approved === true, note: cleanText(parsed.note || '', 500) };
+  } catch {
+    return { approved: /\btrue\b|موافق|approved|approve/i.test(raw), note: '' };
+  }
+}
+
 export default async function handler(req, res) {
   if (!allowMethods(req, res, ['GET', 'POST'])) return;
   const uiLocale = requestLocale(req);
@@ -282,6 +322,161 @@ export default async function handler(req, res) {
         token_usage: { attachments: safeAttachments.map(a => ({ name: cleanText(a.name, 150), type: a.type, size: Number(a.size || 0) })) }
       });
       if (error) throw appError('DATABASE_ERROR', {}, error);
+    }
+
+    if (isFreeGemmaModel(model) && !continuationTarget && !webSearch && safeAttachments.length === 0) {
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('X-Accel-Buffering', 'no');
+
+      const emitStage = (stage, labelAr, labelEn) => res.write(`data: ${JSON.stringify({
+        type: 'agent-stage', stage, label: localize(uiLocale, labelAr, labelEn)
+      })}\n\n`);
+      const emitText = text => {
+        const chunks = String(text || '').match(/[\s\S]{1,700}/g) || [];
+        for (const chunk of chunks) res.write(`data: ${JSON.stringify({ type: 'delta', text: chunk })}\n\n`);
+      };
+      const callAgent = async ({ role, instruction, context, maxTokens = 1800, temperature: agentTemperature = 0.2 }) => {
+        const response = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers['x-forwarded-host'] || req.headers.host || 'localhost'}`,
+            'X-OpenRouter-Title': 'AiWay Agent Test',
+            'X-OpenRouter-Metadata': 'enabled'
+          },
+          body: JSON.stringify({
+            model: model.id,
+            messages: [
+              { role: 'system', content: `${formatSystemPrompt(model, language)}\n\nYou are the ${role} in a controlled multi-agent software workflow. Follow only your assigned role.` },
+              { role: 'user', content: `${instruction}\n\nCONTEXT:\n${cleanText(context, 60000)}` }
+            ],
+            temperature: agentTemperature,
+            max_tokens: Math.max(64, Math.floor(maxTokens)),
+            stream: false,
+            user: user.id
+          })
+        }, 90000);
+        if (!response.ok) throw openRouterError(response.status, await readProviderFailure(response), { kind: 'chat' });
+        const payload = await response.json().catch(() => null);
+        if (payload?.error) throw openRouterError(Number(payload.error?.code || 502), payload, { kind: 'chat' });
+        const content = payload?.choices?.[0]?.message?.content;
+        if (!String(content || '').trim()) throw appError('EMPTY_RESPONSE');
+        return {
+          content: String(content).trim(),
+          usage: payload?.usage || {},
+          generationId: payload?.id || null,
+          routedModelId: payload?.model || model.id
+        };
+      };
+
+      let workflowUsage = {};
+      let answer = '';
+      let generationIds = [];
+      const pendingPlan = extractAgentPlan(cleaned);
+
+      if (!pendingPlan) {
+        emitStage('planning', 'وكيل التخطيط يجهز الخطة', 'Planning agent is preparing the plan');
+        const planner = await callAgent({
+          role: 'planning agent',
+          maxTokens: 1600,
+          instruction: language === 'ar'
+            ? 'حلّل طلب المستخدم كمهندس برمجيات. أنشئ خطة تنفيذ عملية ومختصرة فقط، تشمل الهدف، الملفات أو المكونات، خطوات التنفيذ، ومعايير المراجعة. لا تكتب أي كود الآن. لا تدّع تنفيذ شيء.'
+            : 'Analyze the user request as a software engineer. Produce only a concise, practical implementation plan covering the goal, files or components, implementation steps, and review criteria. Do not write code yet or claim anything was implemented.',
+          context: latestTextValue
+        });
+        workflowUsage = mergeUsage(workflowUsage, planner.usage);
+        generationIds.push(planner.generationId);
+        answer = language === 'ar'
+          ? `## خطة وكيل التخطيط\n\n${planner.content}\n\n## موافقة مطلوبة\n\nاكتب **موافق** لبدء وكيل البرمجة ثم وكيل مراجعة الكود، أو اكتب التعديلات المطلوبة على الخطة.\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`
+          : `## Planning agent\n\n${planner.content}\n\n## Approval required\n\nReply **Approved** to start the coding agent followed by the code-review agent, or describe changes to the plan.\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(planner.content)} -->`;
+      } else {
+        emitStage('approval', 'وكيل الموافقة يتحقق من قرارك', 'Approval agent is checking your decision');
+        const approval = await callAgent({
+          role: 'approval gate agent',
+          maxTokens: 140,
+          temperature: 0,
+          instruction: `Decide whether the user's latest message explicitly approves executing the supplied software plan. Return JSON only: {"approved":true|false,"note":"brief reason"}. Requests to change, explain, delay, cancel, or ask questions are not approval.`,
+          context: `PLAN:\n${pendingPlan}\n\nLATEST USER MESSAGE:\n${latestTextValue}`
+        });
+        workflowUsage = mergeUsage(workflowUsage, approval.usage);
+        generationIds.push(approval.generationId);
+        const decision = parseApprovalDecision(approval.content);
+
+        if (!decision.approved) {
+          answer = language === 'ar'
+            ? `لم يعتبر وكيل الموافقة الرسالة موافقة صريحة على التنفيذ${decision.note ? `: ${decision.note}` : '.'}\n\nاكتب **موافق** للتنفيذ، أو اذكر التعديل المطلوب على الخطة.\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(pendingPlan)} -->`
+            : `The approval agent did not treat that message as explicit approval${decision.note ? `: ${decision.note}` : '.'}\n\nReply **Approved** to execute, or describe the requested plan change.\n\n<!-- ${AGENT_PLAN_MARKER}:${encodeAgentPlan(pendingPlan)} -->`;
+        } else {
+          emitStage('coding', 'وكيل البرمجة يكتب الكود', 'Coding agent is writing the code');
+          const coder = await callAgent({
+            role: 'coding agent',
+            maxTokens: Math.min(6500, Math.max(1800, initialMaxTokens)),
+            temperature: 0.15,
+            instruction: language === 'ar'
+              ? 'نفّذ الخطة المعتمدة. اكتب كودًا كاملًا صالحًا للتشغيل، وليس pseudo-code. استخدم Markdown واضحًا، وضع كل ملف كامل داخل كتلة باسم file-FILENAME عند وجود أكثر من ملف. لا تقل إنك شغّلت اختبارات لم تشغّلها.'
+              : 'Implement the approved plan. Write complete runnable code, not pseudocode. Use clear Markdown and put each complete file in a file-FILENAME fenced block when there is more than one file. Never claim tests were run when they were not.',
+            context: `APPROVED PLAN:\n${pendingPlan}\n\nORIGINAL USER REQUEST:\n${cleaned.filter(m => m.role === 'user').map(m => typeof m.content === 'string' ? m.content : '').join('\n\n')}`
+          });
+          workflowUsage = mergeUsage(workflowUsage, coder.usage);
+          generationIds.push(coder.generationId);
+
+          emitStage('reviewing', 'وكيل المراجعة يفحص الكود ويصححه', 'Review agent is checking and correcting the code');
+          const reviewer = await callAgent({
+            role: 'senior code review agent',
+            maxTokens: Math.min(7000, Math.max(2000, initialMaxTokens)),
+            temperature: 0.1,
+            instruction: language === 'ar'
+              ? 'راجع تنفيذ وكيل البرمجة مقابل الخطة والطلب. أصلح أخطاء المنطق والأمان والصياغة والنواقص مباشرة. أعد النتيجة النهائية الكاملة الجاهزة للنسخ أو التنزيل، وليس قائمة ملاحظات فقط. اذكر باختصار ما راجعته، ثم اعرض الملفات الكاملة المصححة.'
+              : 'Review the coding agent output against the plan and request. Directly fix logic, security, syntax, and completeness problems. Return the complete final corrected result ready to copy or download, not merely review comments. Briefly state what was reviewed, then provide all corrected files in full.',
+            context: `PLAN:\n${pendingPlan}\n\nCODING AGENT OUTPUT:\n${coder.content}`
+          });
+          workflowUsage = mergeUsage(workflowUsage, reviewer.usage);
+          generationIds.push(reviewer.generationId);
+          answer = language === 'ar'
+            ? `## نتيجة وكيل المراجعة\n\n${reviewer.content}`
+            : `## Code-review agent result\n\n${reviewer.content}`;
+        }
+      }
+
+      emitText(answer);
+      const charge = chargeTokens(model.pricing, workflowUsage, false);
+      if (charge.chargedTokens > availableTokens) throw appError('INSUFFICIENT_TOKENS_FOR_REQUEST', {
+        availableTokens, requiredTokens: charge.chargedTokens, shortfall: charge.chargedTokens - availableTokens
+      });
+      const result = await supabase.from('messages').insert({
+        conversation_id: conversationId,
+        user_id: user.id,
+        role: 'assistant',
+        content: answer,
+        model_id: model.id,
+        token_usage: {
+          ...workflowUsage,
+          ...charge,
+          requestedModelId: modelId,
+          activeModelId: model.id,
+          routedModelId: model.id,
+          agentWorkflow: true,
+          agentCount: pendingPlan ? 3 : 1,
+          generationIds: generationIds.filter(Boolean)
+        }
+      }).select('id').single();
+      if (result.error || !result.data) throw appError('DATABASE_ERROR', {}, result.error);
+      const remainingTokens = await finalizeAiTokens(supabase, user.id, requestId, charge.chargedTokens, {
+        messageId: result.data.id, modelId: model.id, generationId: generationIds.filter(Boolean).at(-1) || null
+      });
+      reservationActive = false;
+      await supabase.from('conversations').update({ model_id: model.id, updated_at: new Date().toISOString() })
+        .eq('id', conversationId).eq('user_id', user.id);
+      res.write(`data: ${JSON.stringify({
+        type: 'done', usage: workflowUsage, chargedTokens: charge.chargedTokens, remainingTokens,
+        lowBalance: isLowBalance(remainingTokens, charge.chargedTokens), requestedModelId: modelId,
+        routedModelId: model.id, activeModelId: model.id, messageId: result.data.id,
+        agentWorkflow: true, agentCount: pendingPlan ? 3 : 1
+      })}\n\n`);
+      return res.end();
     }
 
     const requestOpenRouter = (selectedModelId, maxTokens) => fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
