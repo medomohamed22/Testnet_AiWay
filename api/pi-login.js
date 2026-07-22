@@ -205,8 +205,10 @@ export default async function handler(req, res) {
     const { piUid, username } = await verifyPiAccessToken(accessToken);
     const user = await upsertPiUser(supabase, piUid, username);
     const token = await signAppToken(user);
-    setSessionCookie(res, token);
-    return json(res, 200, { user, session: true, sessionToken: token });
+    // Direct sign-in inside Pi Browser is bearer-token only. Do not create a
+    // browser cookie here because Pi's WebView may retain, block, or replay it.
+    // Cookie sessions remain available only for the external-browser bridge.
+    return json(res, 200, { user, session: true, sessionToken: token, authMode: 'bearer' });
   } catch (error) {
     if (error?.name === 'AbortError') return handleError(appError('REQUEST_TIMEOUT', {}, error), res, localize(locale, 'انتهت مهلة تسجيل الدخول. حاول مرة أخرى.', 'Sign-in timed out. Try again.'), locale);
     if (error?.code === 'PI_LOGIN_BRIDGE_EXPIRED') return json(res, 410, {
