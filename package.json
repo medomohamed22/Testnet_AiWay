@@ -8,7 +8,8 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "2.57.4",
-    "jose": "6.1.0"
+    "jose": "6.1.0",
+    "web-push": "3.6.7"
   },
   "devDependencies": {
     "eslint": "^9.39.5"

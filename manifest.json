@@ -1,0 +1,28 @@
+{
+  "name": "AiWay",
+  "short_name": "AiWay",
+  "description": "AiWay — AI chat and image tools powered by Pi Network",
+  "start_url": "/?source=pwa",
+  "id": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#faf8fd",
+  "theme_color": "#6f2dbd",
+  "lang": "ar",
+  "dir": "rtl",
+  "icons": [
+    {
+      "src": "/aiway-logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/aiway-logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
