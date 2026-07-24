@@ -1,4 +1,5 @@
 import {allowMethods,appError,cleanText,createDownloadTicket,db,handleError,json,localize,requestLocale,requireUser,requireAdmin,sendTelegramNotification,telegramHtml,formatCairoDateTime} from './_lib.js';
+import {sendPushToUser} from './app-interactions.js';
 
 async function handleSupport(req,res,user,s,locale){
   const mode=String(req.query?.mode||req.body?.mode||'');
@@ -43,6 +44,8 @@ async function handleSupport(req,res,user,s,locale){
       const {data:thread,error:tErr}=await s.from('support_threads').select('id').eq('id',threadId).single();if(tErr)throw appError('DATABASE_ERROR',{},tErr);
       const {data,error}=await s.from('support_messages').insert({thread_id:thread.id,sender_role:'admin',sender_id:user.id,message}).select('*').single();if(error)throw appError('DATABASE_ERROR',{},error);
       await s.from('support_threads').update({status:'open',updated_at:new Date().toISOString()}).eq('id',thread.id);
+      const {data:threadOwner}=await s.from('support_threads').select('user_id').eq('id',thread.id).maybeSingle();
+      if(threadOwner?.user_id)await sendPushToUser(s,threadOwner.user_id,{title:locale==='en'?'New reply from AiWay support':'رد جديد من دعم AiWay',body:message,url:'/',tag:'aiway-support'});
       return json(res,201,{message:data});
     }
     let {data:thread,error:tErr}=await s.from('support_threads').select('id').eq('user_id',user.id).maybeSingle();if(tErr)throw appError('DATABASE_ERROR',{},tErr);
